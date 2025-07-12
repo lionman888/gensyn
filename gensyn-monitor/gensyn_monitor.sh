@@ -1,0 +1,1298 @@
+#!/bin/bash
+
+# Gensyn RL-Swarm 监控脚本
+# 支持P2P连接错误处理、运行状态监控、查分报警等功能
+
+set -euo pipefail
+
+# =============================================================================
+# 配置区域
+# =============================================================================
+
+# 基础路径配置
+GENSYN_DIR="/root/rl-swarm"
+LOG_FILE="/root/rl-swarm/logs/swarm_launcher.log"
+VENV_PATH="/root/rl-swarm/myenv"
+SCREEN_SESSION="gensyn"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MONITOR_LOG="$SCRIPT_DIR/monitor.log"
+STATE_FILE="$SCRIPT_DIR/monitor_state.json"
+
+# 电报机器人配置
+BOT_TOKEN="8095489389:AAGYdN-mBpiQdniKgEpFtnzC8wfHZAABE1o"
+CHAT_ID="5519262792"
+
+# 监控配置
+MAX_P2P_RETRIES=5
+SCORE_CHECK_INTERVAL=3600  # 1小时
+SCORE_UNCHANGED_THRESHOLD=3  # 连续3小时无变化触发重启
+HEALTH_CHECK_INTERVAL=300   # 5分钟健康检查
+LOG_CHECK_INTERVAL=60       # 1分钟日志检查
+
+# 预设名单
+VALID_NAMES=(
+    "melodic playful slug"
+    "giant deft giraffe"
+    "strong scaly kingfisher"
+    "enormous hulking crocodile"
+    "vigilant soft flea"
+    "secretive running raccoon"
+    "tangled whistling frog"
+    "coiled mammalian puffin"
+    "rabid reptilian hippo"
+    "yawning eager coyote"
+    "peaceful gentle marmot"
+    "peaceful mimic heron"
+    "twitchy ravenous lemur"
+    "bristly screeching chinchilla"
+    "rabid reclusive stingray"
+    "noisy robust chimpanzee"
+    "fanged whistling caribou"
+    "feathered tall chinchilla"
+    "spotted coiled snake"
+    "slow scurrying lizard"
+    "stinging foraging cat"
+    "bristly voracious worm"
+    "chattering stealthy heron"
+    "gregarious armored ladybug"
+    "foxy endangered jackal"
+    "grazing amphibious orangutan"
+    "fishy flapping buffalo"
+    "fleecy stealthy bison"
+    "dextrous bellowing dragonfly"
+    "thorny agile mandrill"
+)
+
+# =============================================================================
+# 工具函数
+# =============================================================================
+
+# 日志函数
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$MONITOR_LOG"
+}
+
+log_error() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" | tee -a "$MONITOR_LOG" >&2
+}
+
+log_info() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: $1" | tee -a "$MONITOR_LOG"
+}
+
+log_warn() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: $1" | tee -a "$MONITOR_LOG"
+}
+
+# 电报推送函数
+send_telegram_message() {
+    local message="$1"
+    
+    # 获取当前节点名称
+    local current_peer_name=""
+    local state=$(load_state)
+    current_peer_name=$(echo "$state" | grep -oP '"peer_name":\s*"\K[^"]*' 2>/dev/null || echo "")
+    
+    # 如果状态文件中没有找到节点名称，尝试从日志中提取
+    if [[ -z "$current_peer_name" ]]; then
+        current_peer_name=$(extract_peer_name)
+    fi
+    
+    # 如果还是没有找到，设置为未知
+    if [[ -z "$current_peer_name" ]]; then
+        current_peer_name="未知"
+    fi
+    
+    local result=$(curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+        -d chat_id="$CHAT_ID" \
+        -d text="🚨 Gensyn Monitor Alert 🚨
+
+$message
+
+📍 节点信息:
+• 节点名称: $current_peer_name
+• 主机名称: $(hostname)
+• 主机IP: $(hostname -I | awk '{print $1}' 2>/dev/null || echo "获取失败")
+
+🕐 时间: $(date '+%Y-%m-%d %H:%M:%S')")
+    
+    if [[ $result == *"\"ok\":true"* ]]; then
+        log_info "电报消息发送成功 [节点: $current_peer_name]"
+    else
+        log_error "电报消息发送失败: $result"
+    fi
+}
+
+# 检查网络连接
+check_network_connectivity() {
+    # 检查是否能连接到Google DNS
+    if ping -c 1 8.8.8.8 &> /dev/null; then
+        return 0  # 网络正常
+    fi
+    
+    # 检查是否能连接到Gensyn API
+    if curl -s --connect-timeout 5 --max-time 10 "https://dashboard.gensyn.ai" &> /dev/null; then
+        return 0  # 网络正常
+    fi
+    
+    return 1  # 网络异常
+}
+
+# 状态文件管理
+save_state() {
+    local peer_name="$1"
+    local last_score="$2"
+    local last_check_time="$3"
+    local unchanged_count="$4"
+    local last_reward="${5:-}"
+    local startup_time="${6:-}"
+    
+    # 如果没有提供启动时间，尝试获取最新的启动时间
+    if [[ -z "$startup_time" ]]; then
+        startup_time=$(get_last_startup_time)
+    fi
+    
+    cat > "$STATE_FILE" << EOF
+{
+    "peer_name": "$peer_name",
+    "last_score": "$last_score",
+    "last_reward": "$last_reward",
+    "last_check_time": "$last_check_time",
+    "unchanged_count": $unchanged_count,
+    "last_restart_time": "$(date '+%Y-%m-%d %H:%M:%S')",
+    "last_startup_time": "$startup_time"
+}
+EOF
+}
+
+load_state() {
+    if [[ -f "$STATE_FILE" ]]; then
+        cat "$STATE_FILE"
+    else
+        echo '{"peer_name": "", "last_score": "", "last_reward": "", "last_check_time": "", "unchanged_count": 0, "last_restart_time": "", "last_startup_time": "0"}'
+    fi
+}
+
+# 检查是否有新的启动（基于启动时间）
+check_new_startup() {
+    local current_startup_time=$(get_last_startup_time)
+    local state=$(load_state)
+    local saved_startup_time=$(echo "$state" | grep -oP '"last_startup_time":\s*"\K[^"]*')
+    
+    # 如果启动时间不一致，说明有新的启动
+    if [[ "$current_startup_time" != "$saved_startup_time" ]]; then
+        return 0  # 有新启动
+    fi
+    return 1  # 没有新启动
+}
+
+# =============================================================================
+# Screen 会话管理
+# =============================================================================
+
+# 检查screen会话是否存在
+check_screen_session() {
+    screen -list | grep -q "gensyn" 2>/dev/null
+}
+
+# 创建screen会话
+create_screen_session() {
+    log_info "创建新的screen会话: $SCREEN_SESSION"
+    cd "$GENSYN_DIR"
+    screen -dmS "$SCREEN_SESSION"
+    sleep 2
+    
+    # 在screen中设置环境并启动脚本
+    screen -S "$SCREEN_SESSION" -X stuff "cd $GENSYN_DIR\n"
+    sleep 1
+    screen -S "$SCREEN_SESSION" -X stuff "source $VENV_PATH/bin/activate\n"
+    sleep 1
+    screen -S "$SCREEN_SESSION" -X stuff "./run_rl_swarm.sh\n"
+    
+    log_info "Screen会话已创建并启动gensyn脚本"
+}
+
+# 在screen内部重启（不重新创建screen会话）
+restart_in_screen() {
+    log_info "在screen会话内部重启gensyn脚本"
+    
+    # 发送Ctrl+C终止当前进程
+    screen -S "$SCREEN_SESSION" -X stuff "\003"
+    sleep 3
+    
+    # 发送多个Ctrl+C确保完全终止
+    screen -S "$SCREEN_SESSION" -X stuff "\003"
+    sleep 2
+    
+    # 清理可能残留的进程
+    pkill -f "python.*rgym" 2>/dev/null || true
+    pkill -f "yarn.*start" 2>/dev/null || true
+    sleep 2
+    
+    # 重新启动脚本
+    screen -S "$SCREEN_SESSION" -X stuff "cd $GENSYN_DIR && source $VENV_PATH/bin/activate\n"
+    sleep 1
+    screen -S "$SCREEN_SESSION" -X stuff "./run_rl_swarm.sh\n"
+    
+    log_info "已在screen内部重启gensyn脚本"
+}
+
+# 强制重启screen会话（最后手段）
+force_restart_screen() {
+    log_warn "强制重启screen会话"
+    
+    # 终止screen会话
+    screen -S "$SCREEN_SESSION" -X quit 2>/dev/null || true
+    sleep 2
+    
+    # 清理残留进程
+    pkill -f "python.*rgym" 2>/dev/null || true
+    pkill -f "yarn.*start" 2>/dev/null || true
+    sleep 3
+    
+    # 重新创建screen会话
+    create_screen_session
+    
+    log_info "Screen会话已强制重启"
+}
+
+# =============================================================================
+# 状态检测函数
+# =============================================================================
+
+# 检测P2P连接错误
+check_p2p_error() {
+    if [[ -f "$LOG_FILE" ]]; then
+        # 检查最近的P2P错误 - 扩展模式匹配
+        if tail -100 "$LOG_FILE" | grep -qE "P2PDaemonError.*Daemon failed to start|P2PDaemonError\(.*Daemon failed to start"; then
+            return 0  # 发现P2P错误
+        fi
+        
+        # 检查其他P2P相关错误
+        if tail -100 "$LOG_FILE" | grep -qE "hivemind.*backend.*error|HivemindBackend.*error|P2P.*connection.*failed"; then
+            log_error "检测到P2P后端或连接错误"
+            return 0  # 发现P2P相关错误
+        fi
+    fi
+    return 1  # 没有P2P错误
+}
+
+# 检测启动成功标志
+check_startup_success() {
+    if [[ -f "$LOG_FILE" ]]; then
+        # 检查整个日志文件中是否有启动成功标志
+        local success_line=$(grep "🐱 Hello 🐈 \[.*\] 🦮" "$LOG_FILE" | tail -1)
+        if [[ -n "$success_line" ]]; then
+            # 进一步检查：确保进程仍在运行
+            if check_process_running; then
+                return 0  # 启动成功且进程在运行
+            fi
+        fi
+    fi
+    return 1  # 启动未成功
+}
+
+# 提取动物名称和启动时间
+extract_peer_name() {
+    if [[ -f "$LOG_FILE" ]]; then
+        # 在整个日志文件中查找启动标志，获取最近一次
+        local line=$(grep "🐱 Hello 🐈 \[.*\] 🦮" "$LOG_FILE" | tail -1)
+        if [[ -n "$line" ]]; then
+            # 使用sed提取方括号内的内容
+            echo "$line" | sed 's/.*🐱 Hello 🐈 \[\([^]]*\)\] 🦮.*/\1/' | head -1
+        else
+            echo ""
+        fi
+    else
+        echo ""
+    fi
+}
+
+# 获取最近一次启动的时间戳
+get_last_startup_time() {
+    if [[ -f "$LOG_FILE" ]]; then
+        # 获取最近一次启动标志的时间
+        local line=$(grep "🐱 Hello 🐈 \[.*\] 🦮" "$LOG_FILE" | tail -1)
+        if [[ -n "$line" ]]; then
+            # 提取时间戳
+            local log_time=$(echo "$line" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
+            if [[ -n "$log_time" ]]; then
+                date -d "$log_time" +%s 2>/dev/null || echo "0"
+            else
+                echo "0"
+            fi
+        else
+            echo "0"
+        fi
+    else
+        echo "0"
+    fi
+}
+
+# 检查动物名称是否在预设名单中
+validate_peer_name() {
+    local peer_name="$1"
+    for valid_name in "${VALID_NAMES[@]}"; do
+        if [[ "$peer_name" == "$valid_name" ]]; then
+            return 0  # 名称有效
+        fi
+    done
+    return 1  # 名称无效
+}
+
+# 检查进程是否正在运行
+check_process_running() {
+    if ps aux | grep -q "python.*rgym" && ps aux | grep -q "yarn.*start"; then
+        return 0  # 进程正在运行
+    fi
+    return 1  # 进程未运行
+}
+
+# 检查训练是否正常进行
+check_training_progress() {
+    if [[ -f "$LOG_FILE" ]]; then
+        local current_time=$(date +%s)
+        local last_startup_time=$(get_last_startup_time)
+        
+        # 检查监控脚本是否刚启动（给5分钟宽松期）
+        local state=$(load_state)
+        local monitor_start_time=$(echo "$state" | grep -oP '"last_restart_time":\s*"\K[^"]*')
+        if [[ -n "$monitor_start_time" ]]; then
+            local monitor_timestamp=$(date -d "$monitor_start_time" +%s 2>/dev/null || echo "0")
+            local monitor_running_time=$((current_time - monitor_timestamp))
+            
+            # 如果监控脚本运行不到5分钟，使用宽松检查
+            if [[ $monitor_running_time -lt 300 ]]; then
+                log_info "监控脚本刚启动，使用宽松的训练进度检查"
+                local recent_logs=$(tail -100 "$LOG_FILE" | grep -E "Starting round|Joining round|🐝 Joining round|Already finished round" | tail -5)
+                if [[ -n "$recent_logs" ]]; then
+                    return 0  # 有训练相关日志，认为正常
+                fi
+                # 继续后面的详细检查
+            fi
+        fi
+        
+        # 如果无法获取启动时间，使用传统检查方式
+        if [[ "$last_startup_time" == "0" ]]; then
+            local recent_logs=$(tail -100 "$LOG_FILE" | grep -E "Starting round|Joining round|🐝 Joining round" | tail -5)
+            if [[ -n "$recent_logs" ]]; then
+                return 0  # 有训练日志，认为正常
+            fi
+            return 1  # 训练异常
+        fi
+        
+        # 获取最近启动之后的所有训练日志
+        local startup_date=$(date -d "@$last_startup_time" '+%Y-%m-%d %H:%M:%S')
+        log_info "检查训练进度：启动时间 $startup_date 之后的训练日志"
+        
+        # 使用awk来获取启动时间之后的训练日志
+        local training_logs_after_startup=$(awk -v start_time="$startup_date" '
+            BEGIN { found = 0 }
+            $0 ~ /Starting round|Joining round|🐝 Joining round/ && $0 >= start_time { found = 1 }
+            found && /Starting round|Joining round|🐝 Joining round/ { print }
+        ' "$LOG_FILE" | tail -5)
+        
+        log_info "找到 $(echo "$training_logs_after_startup" | wc -l) 条启动后的训练日志"
+        
+        if [[ -n "$training_logs_after_startup" ]]; then
+            # 检查最后一条训练日志的时间
+            local last_training_log=$(echo "$training_logs_after_startup" | tail -1)
+            local log_time=$(echo "$last_training_log" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
+            
+            if [[ -n "$log_time" ]]; then
+                local log_timestamp=$(date -d "$log_time" +%s 2>/dev/null || echo "0")
+                local time_diff=$((current_time - log_timestamp))
+                
+                # 如果最后一条训练日志在30分钟内，认为训练正常（放宽时间限制）
+                if [[ $time_diff -lt 1800 ]]; then
+                    log_info "最后训练日志时间差: ${time_diff}秒，训练正常"
+                    return 0  # 训练正常
+                else
+                    log_warn "最后训练日志时间差: ${time_diff}秒，超过30分钟阈值"
+                fi
+            fi
+        fi
+        
+        # 检查最近启动后是否有"Already finished round"日志
+        local finished_logs_after_startup=$(awk -v start_time="$startup_date" '
+            BEGIN { found = 0 }
+            $0 ~ /Already finished round/ && $0 >= start_time { found = 1 }
+            found && /Already finished round/ { print }
+        ' "$LOG_FILE" | tail -10)
+        
+        if [[ -n "$finished_logs_after_startup" ]]; then
+            # 检查最后一条完成日志的时间
+            local last_finished_log=$(echo "$finished_logs_after_startup" | tail -1)
+            local log_time=$(echo "$last_finished_log" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
+            
+            if [[ -n "$log_time" ]]; then
+                local log_timestamp=$(date -d "$log_time" +%s 2>/dev/null || echo "0")
+                local time_diff=$((current_time - log_timestamp))
+                
+                # 如果最后一条完成日志在30分钟内，也认为是正常的（放宽时间限制）
+                if [[ $time_diff -lt 1800 ]]; then
+                    return 0  # 训练正常
+                fi
+            fi
+        fi
+    fi
+    return 1  # 训练异常
+}
+
+# 检查内存或其他严重错误
+check_critical_errors() {
+    if [[ -f "$LOG_FILE" ]]; then
+        # 检查最近的严重错误
+        if tail -50 "$LOG_FILE" | grep -qE "OutOfMemoryError|MemoryError|Fatal|Segmentation fault|killed"; then
+            return 0  # 发现严重错误
+        fi
+        
+        # 检查Hydra相关错误
+        if tail -50 "$LOG_FILE" | grep -qE "hydra\.errors\.InstantiationException|Error in call to target|FileNotFoundError.*No such file or directory"; then
+            log_error "检测到Hydra配置或文件缺失错误"
+            return 0  # 发现配置错误
+        fi
+        
+        # 检查Python运行时错误
+        if tail -50 "$LOG_FILE" | grep -qE "Traceback \(most recent call last\)|ModuleNotFoundError|ImportError|AttributeError"; then
+            log_error "检测到Python运行时错误"
+            return 0  # 发现Python错误
+        fi
+        
+        # 检查进程意外退出
+        if tail -50 "$LOG_FILE" | grep -qE "Terminated|Killed|Process finished with exit code|KeyboardInterrupt"; then
+            log_error "检测到进程意外退出"
+            return 0  # 发现进程退出
+        fi
+        
+        # 检查rl-swarm特定错误
+        if tail -50 "$LOG_FILE" | grep -qE ">> An error was detected while running rl-swarm|>> Shutting down trainer"; then
+            log_error "检测到rl-swarm系统错误或训练器关闭"
+            return 0  # 发现系统错误
+        fi
+    fi
+    return 1  # 没有严重错误
+}
+
+# 检查程序运行稳定性（是否频繁重启或崩溃）
+check_runtime_stability() {
+    if [[ -f "$LOG_FILE" ]]; then
+        local current_time=$(date +%s)
+        local last_startup_time=$(get_last_startup_time)
+        
+        # 如果无法获取启动时间，跳过检查
+        if [[ "$last_startup_time" == "0" ]]; then
+            return 0  # 无法确定，认为正常
+        fi
+        
+        local runtime=$((current_time - last_startup_time))
+        
+        # 如果程序运行时间少于5分钟，检查是否有错误日志
+        if [[ $runtime -lt 300 ]]; then
+            log_info "程序运行时间较短（${runtime}秒），检查是否有错误"
+            
+            # 获取启动后的错误日志
+            local startup_date=$(date -d "@$last_startup_time" '+%Y-%m-%d %H:%M:%S')
+            local recent_errors=$(awk -v start_time="$startup_date" '
+                $0 >= start_time && /ERROR|Error|Exception|Traceback|Failed|failed/ { print }
+            ' "$LOG_FILE" | tail -10)
+            
+            if [[ -n "$recent_errors" ]]; then
+                log_error "检测到启动后的错误日志，程序可能不稳定"
+                echo "$recent_errors" | head -5 | while read line; do
+                    log_error "错误详情: $line"
+                done
+                return 1  # 运行不稳定
+            fi
+        fi
+        
+        # 检查最近是否有多次启动（频繁重启）
+        local startup_count=$(grep -c "🐱 Hello 🐈" "$LOG_FILE" | tail -1)
+        if [[ $startup_count -gt 3 ]]; then
+            # 检查最近1小时内的启动次数
+            local one_hour_ago=$(date -d "1 hour ago" '+%Y-%m-%d %H:%M:%S')
+            local recent_startups=$(awk -v start_time="$one_hour_ago" '
+                $0 >= start_time && /🐱 Hello 🐈/ { print }
+            ' "$LOG_FILE" | wc -l)
+            
+            if [[ $recent_startups -gt 2 ]]; then
+                log_error "检测到频繁重启：最近1小时内启动了${recent_startups}次"
+                return 1  # 频繁重启
+            fi
+        fi
+    fi
+    return 0  # 运行稳定
+}
+
+# 检查是否卡在等待身份文件阶段
+check_identity_stuck() {
+    if [[ -f "$LOG_FILE" ]]; then
+        local recent_logs=$(tail -20 "$LOG_FILE")
+        
+        # 检查是否有等待身份文件的日志
+        if echo "$recent_logs" | grep -q "Waiting for modal userData.json to be created"; then
+            # 进一步检查是否真的卡住了（最近5分钟内有这个日志）
+            local waiting_line=$(echo "$recent_logs" | grep "Waiting for modal userData.json to be created" | tail -1)
+            if [[ -n "$waiting_line" ]]; then
+                local log_time=$(echo "$waiting_line" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
+                if [[ -n "$log_time" ]]; then
+                    local log_timestamp=$(date -d "$log_time" +%s 2>/dev/null || echo "0")
+                    local current_time=$(date +%s)
+                    local time_diff=$((current_time - log_timestamp))
+                    
+                    # 如果等待身份文件的日志在5分钟内，认为可能卡住了
+                    if [[ $time_diff -lt 300 ]] && [[ $time_diff -gt 30 ]]; then
+                        return 0  # 卡在身份文件阶段
+                    fi
+                fi
+            fi
+        fi
+    fi
+    return 1  # 没有卡住
+}
+
+# 自动复制身份文件
+auto_copy_identity_files() {
+    log_info "检测到身份文件等待超时，尝试自动复制备份文件"
+    
+    # 检查备份文件是否存在
+    if [[ -f "/root/rl-swarm-backup/userApiKey.json" ]] && [[ -f "/root/rl-swarm-backup/userData.json" ]]; then
+        log_info "找到备份身份文件，开始复制..."
+        
+        # 创建目标目录
+        mkdir -p "$GENSYN_DIR/modal-login/temp-data"
+        
+        # 复制文件
+        if cp /root/rl-swarm-backup/userApiKey.json "$GENSYN_DIR/modal-login/temp-data/" && \
+           cp /root/rl-swarm-backup/userData.json "$GENSYN_DIR/modal-login/temp-data/"; then
+            log_info "身份文件复制成功！"
+            
+            # 设置适当的权限
+            chmod 644 "$GENSYN_DIR/modal-login/temp-data/userApiKey.json"
+            chmod 644 "$GENSYN_DIR/modal-login/temp-data/userData.json"
+            
+            send_telegram_message "身份文件自动复制成功
+备份文件已复制到 modal-login/temp-data/
+程序应该很快恢复正常运行"
+            
+            return 0  # 复制成功
+        else
+            log_error "身份文件复制失败"
+            return 1  # 复制失败
+        fi
+    else
+        log_error "备份身份文件不存在：/root/rl-swarm-backup/"
+        send_telegram_message "身份文件卡住，但备份文件不存在
+请手动检查 /root/rl-swarm-backup/ 目录
+或者手动登录 http://localhost:3000"
+        return 1  # 备份文件不存在
+    fi
+}
+
+# =============================================================================
+# 查分功能
+# =============================================================================
+
+# 查询分数和奖励（基于原有的Python查分脚本逻辑）
+query_score_and_reward() {
+    local peer_name="$1"
+    
+    # 检查Python3是否可用
+    if ! command -v python3 &> /dev/null; then
+        log_error "Python3 未安装，无法进行查分"
+        echo "N/A:N/A:false"
+        return 1
+    fi
+    
+    # URL编码节点名称
+    local encoded_name=$(python3 -c "
+import urllib.parse
+import sys
+try:
+    print(urllib.parse.quote('$peer_name'))
+except Exception as e:
+    print('$peer_name')
+" 2>/dev/null)
+    
+    if [[ -z "$encoded_name" ]]; then
+        log_error "URL编码失败"
+        echo "N/A:N/A:false"
+        return 1
+    fi
+    
+    # API调用
+    local api_url="https://dashboard.gensyn.ai/api/v1/peer?name=$encoded_name"
+    local response=$(curl -s -H "Accept: application/json" \
+        -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36" \
+        --connect-timeout 10 \
+        --max-time 30 \
+        "$api_url" 2>/dev/null)
+    
+    if [[ $? -eq 0 ]] && [[ -n "$response" ]]; then
+        # 检查响应是否包含错误
+        if echo "$response" | grep -q "error\|Error\|404"; then
+            log_error "API响应包含错误: $response"
+            echo "N/A:N/A:false"
+            return 1
+        fi
+        
+        # 解析JSON响应
+        local score=$(echo "$response" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print(data.get('score', 'N/A'))
+except Exception as e:
+    print('N/A')
+" 2>/dev/null)
+        
+        local reward=$(echo "$response" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print(data.get('reward', 'N/A'))
+except Exception as e:
+    print('N/A')
+" 2>/dev/null)
+        
+        local online=$(echo "$response" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print('true' if data.get('online', False) else 'false')
+except Exception as e:
+    print('false')
+" 2>/dev/null)
+        
+        # 返回格式: score:reward:online
+        echo "$score:$reward:$online"
+    else
+        log_error "API调用失败或返回空响应"
+        echo "N/A:N/A:false"
+        return 1
+    fi
+}
+
+# 检查分数变化
+check_score_change() {
+    local peer_name="$1"
+    
+    # 检查网络连接
+    if ! check_network_connectivity; then
+        log_error "网络连接异常，跳过本次查分"
+        return 0  # 网络问题不触发重启
+    fi
+    
+    local state=$(load_state)
+    local last_score=$(echo "$state" | grep -oP '"last_score":\s*"\K[^"]*')
+    local last_reward=$(echo "$state" | grep -oP '"last_reward":\s*"\K[^"]*')
+    local unchanged_count=$(echo "$state" | grep -oP '"unchanged_count":\s*\K[0-9]+')
+    
+    # 检查是否有新的启动，如果有则重置计数器
+    if check_new_startup; then
+        log_info "检测到新的启动，重置分数变化计数器"
+        unchanged_count=0
+    fi
+    
+    # 查询当前分数和奖励
+    local result=$(query_score_and_reward "$peer_name")
+    local current_score=$(echo "$result" | cut -d: -f1)
+    local current_reward=$(echo "$result" | cut -d: -f2)
+    local online_status=$(echo "$result" | cut -d: -f3)
+    local current_time=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    # 如果查分失败，不触发重启
+    if [[ "$current_score" == "N/A" ]]; then
+        log_warn "查分失败，跳过本次检查"
+        return 0
+    fi
+    
+    log_info "当前分数: $current_score, 上次分数: $last_score"
+    log_info "当前奖励: $current_reward, 上次奖励: $last_reward"
+    log_info "在线状态: $online_status"
+    
+    # 检查设备是否在线
+            if [[ "$online_status" == "false" ]]; then
+        log_error "设备离线，触发重启"
+        send_telegram_message "设备离线，触发重启
+当前分数: $current_score
+当前奖励: $current_reward
+在线状态: 离线"
+        
+        save_state "$peer_name" "$current_score" "$current_time" "$unchanged_count" "$current_reward"
+        return 1  # 需要重启
+    fi
+    
+    # 检查分数是否无变化
+    if [[ "$current_score" == "$last_score" ]]; then
+        unchanged_count=$((unchanged_count + 1))
+        log_warn "分数未变化，连续 $unchanged_count 次"
+        
+        if [[ $unchanged_count -ge $SCORE_UNCHANGED_THRESHOLD ]]; then
+            log_error "分数连续 $unchanged_count 小时未变化，触发重启"
+            send_telegram_message "分数连续 $unchanged_count 小时未变化，触发重启
+当前分数: $current_score
+当前奖励: $current_reward
+连续未变化次数: $unchanged_count"
+            
+            # 重置计数器并触发重启
+            unchanged_count=0
+            save_state "$peer_name" "$current_score" "$current_time" "$unchanged_count" "$current_reward"
+            return 1  # 需要重启
+        fi
+    else
+        log_info "分数有变化，重置计数器"
+        unchanged_count=0
+    fi
+    
+    save_state "$peer_name" "$current_score" "$current_time" "$unchanged_count" "$current_reward"
+    return 0  # 不需要重启
+}
+
+# =============================================================================
+# 主要处理函数
+# =============================================================================
+
+# 处理P2P连接错误
+handle_p2p_error() {
+    local retry_count=0
+    
+    while [[ $retry_count -lt $MAX_P2P_RETRIES ]]; do
+        log_warn "检测到P2P连接错误，尝试重启 (${retry_count}/${MAX_P2P_RETRIES})"
+        
+        # 在screen内部重启
+        restart_in_screen
+        
+        # 等待启动
+        sleep 30
+        
+        # 检查是否启动成功
+        local wait_time=0
+        while [[ $wait_time -lt 120 ]]; do
+            if check_startup_success; then
+                log_info "P2P连接重启成功"
+                return 0
+            fi
+            sleep 10
+            wait_time=$((wait_time + 10))
+        done
+        
+        retry_count=$((retry_count + 1))
+    done
+    
+    log_error "P2P连接重启失败，已尝试 $MAX_P2P_RETRIES 次"
+    send_telegram_message "P2P连接重启失败，已尝试 $MAX_P2P_RETRIES 次，需要人工处理"
+    return 1
+}
+
+# 处理启动流程
+handle_startup() {
+    log_info "开始启动监控"
+    
+    # 检查screen会话
+    if ! check_screen_session; then
+        log_info "Screen会话不存在，创建新会话"
+        create_screen_session
+    else
+        log_info "Screen会话已存在"
+    fi
+    
+    # 立即检查是否已经启动成功（对于长时间运行的程序）
+    if check_startup_success; then
+        local peer_name=$(extract_peer_name)
+        log_info "启动成功！动物名称: $peer_name"
+        
+        # 验证名称
+        if validate_peer_name "$peer_name"; then
+            log_info "动物名称验证通过: $peer_name"
+            local startup_time=$(get_last_startup_time)
+            save_state "$peer_name" "" "$(date '+%Y-%m-%d %H:%M:%S')" 0 "" "$startup_time"
+            send_telegram_message "监控脚本已启动并正常运行
+当前状态: 正常运行
+监控功能: 已激活"
+            return 0
+        else
+            log_error "动物名称验证失败: $peer_name"
+            send_telegram_message "动物名称验证失败！
+该名称不在预设名单中，请检查账号配置"
+            return 1
+        fi
+    fi
+    
+    # 如果没有立即检测到成功，等待新的启动
+    log_info "等待程序启动..."
+    local wait_time=0
+    while [[ $wait_time -lt 300 ]]; do
+        if check_startup_success; then
+            local peer_name=$(extract_peer_name)
+            log_info "启动成功！动物名称: $peer_name"
+            
+            # 验证名称
+            if validate_peer_name "$peer_name"; then
+                log_info "动物名称验证通过: $peer_name"
+                local startup_time=$(get_last_startup_time)
+                save_state "$peer_name" "" "$(date '+%Y-%m-%d %H:%M:%S')" 0 "" "$startup_time"
+                send_telegram_message "监控脚本已启动并正常运行
+当前状态: 正常运行
+监控功能: 已激活"
+                return 0
+            else
+                log_error "动物名称验证失败: $peer_name"
+                send_telegram_message "动物名称验证失败！
+该名称不在预设名单中，请检查账号配置"
+                return 1
+            fi
+        fi
+        
+        # 检查是否有P2P错误
+        if check_p2p_error; then
+            log_warn "启动过程中发现P2P错误，尝试重启"
+            handle_p2p_error
+            wait_time=0  # 重置等待时间
+        fi
+        
+        sleep 10
+        wait_time=$((wait_time + 10))
+    done
+    
+    log_error "启动超时，未能成功启动"
+    send_telegram_message "Gensyn启动超时，未能成功启动，请检查系统状态"
+    return 1
+}
+
+# 健康检查
+health_check() {
+    local issues=()
+    local is_recovery_period=false
+    
+    # 检查是否在重启恢复期（给重启后10分钟的恢复时间）
+    local state=$(load_state)
+    local last_restart_time=$(echo "$state" | grep -oP '"last_restart_time":\s*"\K[^"]*')
+    if [[ -n "$last_restart_time" ]]; then
+        local restart_timestamp=$(date -d "$last_restart_time" +%s 2>/dev/null || echo "0")
+        local current_time=$(date +%s)
+        local recovery_time=$((current_time - restart_timestamp))
+        
+        if [[ $recovery_time -lt 600 ]]; then  # 10分钟恢复期
+            is_recovery_period=true
+            log_info "重启恢复期：已过 ${recovery_time} 秒（恢复期10分钟）"
+        fi
+    fi
+    
+    # 检查screen会话
+    if ! check_screen_session; then
+        issues+=("Screen会话不存在")
+        log_error "健康检查详情：Screen会话不存在"
+    fi
+    
+    # 检查进程
+    if ! check_process_running; then
+        if [[ "$is_recovery_period" == "true" ]]; then
+            log_warn "健康检查详情：进程未运行（恢复期内，可能正在启动）"
+        else
+            issues+=("核心进程未运行")
+            log_error "健康检查详情：核心进程未运行"
+        fi
+    fi
+    
+    # 检查日志文件
+    if [[ ! -f "$LOG_FILE" ]]; then
+        issues+=("日志文件不存在")
+        log_error "健康检查详情：日志文件不存在: $LOG_FILE"
+    fi
+    
+    # 检查P2P连接错误（优先级高）
+    if check_p2p_error; then
+        issues+=("P2P连接错误")
+        log_error "健康检查详情：检测到P2P连接错误，需要重启"
+        return 1  # P2P错误需要立即处理
+    fi
+    
+    # 检查训练进度（在恢复期内放宽要求）
+    if [[ "$is_recovery_period" == "true" ]]; then
+        log_info "健康检查详情：恢复期内，跳过训练进度检查"
+    else
+        if ! check_training_progress; then
+            issues+=("训练进度异常")
+            log_error "健康检查详情：训练进度异常（超过30分钟无训练活动）"
+        fi
+    fi
+    
+    # 检查严重错误
+    if check_critical_errors; then
+        issues+=("检测到严重错误")
+        log_error "健康检查详情：检测到内存、配置或系统严重错误"
+    fi
+    
+    # 检查运行稳定性（在恢复期内放宽要求）
+    if [[ "$is_recovery_period" == "true" ]]; then
+        log_info "健康检查详情：恢复期内，跳过运行稳定性检查"
+    else
+        if ! check_runtime_stability; then
+            issues+=("程序运行不稳定")
+            log_error "健康检查详情：程序频繁重启或启动后出现错误"
+        fi
+    fi
+    
+    # 检查身份文件卡住问题
+    if check_identity_stuck; then
+        issues+=("身份文件等待超时")
+        log_error "健康检查详情：检测到身份文件等待超时，需要自动修复"
+        
+        # 尝试自动修复
+        if auto_copy_identity_files; then
+            log_info "身份文件已自动修复，等待程序恢复"
+            # 给程序2分钟时间处理身份文件
+            sleep 120
+            
+            # 重新检查是否还卡住
+            if ! check_identity_stuck; then
+                log_info "身份文件问题已解决"
+                # 移除这个问题标记，因为已经解决了
+                issues=("${issues[@]/身份文件等待超时}")
+            fi
+        else
+            log_error "身份文件自动修复失败"
+        fi
+    fi
+    
+    if [[ ${#issues[@]} -gt 0 ]]; then
+        local issue_text=$(IFS=', '; echo "${issues[*]}")
+        log_error "健康检查失败: $issue_text"
+        return 1
+    else
+        log_info "健康检查通过"
+        return 0
+    fi
+}
+
+# =============================================================================
+# 主监控循环
+# =============================================================================
+
+main_monitor_loop() {
+    log_info "开始主监控循环"
+    
+    local last_score_check=0
+    local last_health_check=0
+    
+    while true; do
+        local current_time=$(date +%s)
+        
+        # 健康检查
+        if [[ $((current_time - last_health_check)) -ge $HEALTH_CHECK_INTERVAL ]]; then
+            if ! health_check; then
+                log_warn "健康检查失败，尝试修复"
+                
+                # 检查具体失败原因并采取相应措施
+                if check_p2p_error; then
+                    log_info "健康检查失败原因：P2P连接错误，启动专门的P2P修复流程"
+                    
+                    # P2P错误专门处理
+                    local p2p_retry_count=0
+                    local max_p2p_retries=10  # 给更多重试机会
+                    
+                    while [[ $p2p_retry_count -lt $max_p2p_retries ]]; do
+                        p2p_retry_count=$((p2p_retry_count + 1))
+                        log_warn "P2P错误修复尝试 ${p2p_retry_count}/${max_p2p_retries}"
+                        
+                        restart_in_screen
+                        
+                        # 给P2P连接更多时间
+                        local p2p_wait=0
+                        local p2p_fixed=false
+                        
+                                                 while [[ $p2p_wait -lt 180 ]]; do  # 等待3分钟
+                             sleep 30
+                             p2p_wait=$((p2p_wait + 30))
+                             
+                             # 优先检查身份文件问题（可能导致P2P错误的根本原因）
+                             if check_identity_stuck; then
+                                 log_info "P2P错误期间发现身份文件问题，优先修复身份文件"
+                                 if auto_copy_identity_files; then
+                                     log_info "身份文件已修复，继续等待P2P连接"
+                                     sleep 60  # 给身份文件处理时间
+                                 fi
+                             fi
+                             
+                             if ! check_p2p_error; then
+                                 log_info "P2P错误已修复！"
+                                 p2p_fixed=true
+                                 break
+                             else
+                                 log_warn "P2P错误仍存在，继续等待... ($p2p_wait/180秒)"
+                             fi
+                         done
+                        
+                        if [[ "$p2p_fixed" == "true" ]]; then
+                            break
+                        fi
+                    done
+                    
+                    if [[ $p2p_retry_count -ge $max_p2p_retries ]]; then
+                        log_error "P2P错误修复失败，已尝试 $max_p2p_retries 次"
+                        send_telegram_message "P2P连接持续错误，已尝试修复 $max_p2p_retries 次，需要人工处理"
+                    fi
+                    
+                else
+                    # 非P2P错误的常规处理
+                    log_info "健康检查失败原因：非P2P错误，进行常规重启"
+                    
+                    if check_screen_session; then
+                        restart_in_screen
+                    else
+                        create_screen_session
+                    fi
+                    
+                    # 重启后进入恢复期
+                    log_info "重启完成，进入10分钟恢复期..."
+                    local recovery_start=$(date +%s)
+                    
+                    while true; do
+                        local recovery_elapsed=$(($(date +%s) - recovery_start))
+                        
+                        if [[ $recovery_elapsed -gt 600 ]]; then  # 10分钟恢复期
+                            log_warn "恢复期结束，继续正常监控"
+                            break
+                        fi
+                        
+                        # 每60秒检查一次恢复状态
+                        if [[ $((recovery_elapsed % 60)) -eq 0 ]]; then
+                            log_info "恢复期状态检查：已过 $recovery_elapsed 秒"
+                            
+                                                         # 在恢复期内，优先检查P2P错误
+                             if check_p2p_error; then
+                                 log_warn "恢复期发现P2P错误，重新启动"
+                                 restart_in_screen
+                                 sleep 60
+                             elif check_identity_stuck; then
+                                 log_warn "恢复期发现身份文件卡住，尝试修复"
+                                 if auto_copy_identity_files; then
+                                     log_info "恢复期：身份文件已修复，等待程序处理"
+                                     sleep 120  # 等待2分钟让程序处理身份文件
+                                 else
+                                     log_error "恢复期：身份文件修复失败"
+                                 fi
+                             elif check_startup_success; then
+                                 log_info "恢复期检查：程序已成功启动"
+                                 # 不立即退出恢复期，让程序稳定运行一段时间
+                             fi
+                        fi
+                        
+                        sleep 30  # 每30秒检查一次
+                    done
+                fi
+            fi
+            last_health_check=$current_time
+        fi
+        
+        # 查分检查
+        if [[ $((current_time - last_score_check)) -ge $SCORE_CHECK_INTERVAL ]]; then
+            local state=$(load_state)
+            local peer_name=$(echo "$state" | grep -oP '"peer_name":\s*"\K[^"]*')
+            
+            if [[ -n "$peer_name" ]]; then
+                if ! check_score_change "$peer_name"; then
+                    log_warn "分数检查触发重启"
+                    restart_in_screen
+                    sleep 30
+                fi
+            else
+                log_warn "未找到peer名称，尝试重新提取"
+                peer_name=$(extract_peer_name)
+                if [[ -n "$peer_name" ]]; then
+                    local startup_time=$(get_last_startup_time)
+                    save_state "$peer_name" "" "$(date '+%Y-%m-%d %H:%M:%S')" 0 "" "$startup_time"
+                fi
+            fi
+            last_score_check=$current_time
+        fi
+        
+        # P2P错误检查已集成到健康检查中，不需要单独检查
+        
+        sleep $LOG_CHECK_INTERVAL
+    done
+}
+
+# =============================================================================
+# 信号处理和清理
+# =============================================================================
+
+cleanup() {
+    log_info "监控脚本正在退出..."
+    exit 0
+}
+
+trap cleanup EXIT SIGINT SIGTERM
+
+# =============================================================================
+# 主函数
+# =============================================================================
+
+main() {
+    log_info "Gensyn监控脚本启动"
+    log_info "工作目录: $GENSYN_DIR"
+    log_info "日志文件: $LOG_FILE"
+    log_info "Screen会话: $SCREEN_SESSION"
+    
+    # 创建必要的目录
+    mkdir -p "$(dirname "$MONITOR_LOG")"
+    mkdir -p "$(dirname "$STATE_FILE")"
+    
+    # 初始化启动
+    if ! handle_startup; then
+        log_error "初始化启动失败"
+        exit 1
+    fi
+    
+    # 开始主监控循环
+    main_monitor_loop
+}
+
+# 调试函数 - 显示启动时间信息
+debug_startup_info() {
+    local current_startup_time=$(get_last_startup_time)
+    local startup_date=$(date -d "@$current_startup_time" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "无法解析")
+    local state=$(load_state)
+    local saved_startup_time=$(echo "$state" | grep -oP '"last_startup_time":\s*"\K[^"]*')
+    local saved_startup_date=$(date -d "@$saved_startup_time" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "无法解析")
+    
+    echo "=== 启动时间调试信息 ==="
+    echo "当前日志中的启动时间: $startup_date (时间戳: $current_startup_time)"
+    echo "状态文件中的启动时间: $saved_startup_date (时间戳: $saved_startup_time)"
+    
+    if [[ "$current_startup_time" != "$saved_startup_time" ]]; then
+        echo "状态: 检测到新的启动"
+    else
+        echo "状态: 启动时间一致"
+    fi
+    
+    echo "动物名称: $(extract_peer_name)"
+    echo "=========================="
+}
+
+# 快速状态检查函数
+quick_status_check() {
+    echo "=== 快速状态检查 ==="
+    echo "时间: $(date)"
+    echo ""
+    
+    echo "Screen会话:"
+    screen -list | grep gensyn || echo "  无gensyn会话"
+    echo ""
+    
+    echo "进程状态:"
+    ps aux | grep -E "(python.*rgym|yarn.*start)" | grep -v grep || echo "  无相关进程"
+    echo ""
+    
+    echo "日志文件:"
+    if [[ -f "$LOG_FILE" ]]; then
+        echo "  存在: $LOG_FILE"
+        echo "  最后10行:"
+        tail -10 "$LOG_FILE" | sed 's/^/    /'
+    else
+        echo "  不存在: $LOG_FILE"
+    fi
+    echo ""
+    
+    echo "P2P错误检查:"
+    if check_p2p_error; then
+        echo "  ❌ 检测到P2P错误"
+        tail -50 "$LOG_FILE" | grep -E "P2PDaemonError|hivemind.*backend.*error|HivemindBackend.*error" | tail -3 | sed 's/^/    /'
+    else
+        echo "  ✅ 无P2P错误"
+    fi
+    echo ""
+    
+    echo "启动状态:"
+    if check_startup_success; then
+        echo "  ✅ 启动成功"
+        echo "  动物名称: $(extract_peer_name)"
+    else
+        echo "  ❌ 启动未成功"
+    fi
+    echo ""
+    
+    echo "训练进度:"
+    if check_training_progress; then
+        echo "  ✅ 训练正常"
+    else
+        echo "  ❌ 训练异常"
+    fi
+    echo ""
+    
+    echo "身份文件状态:"
+    if check_identity_stuck; then
+        echo "  ❌ 身份文件等待超时"
+        echo "  检查备份文件:"
+        if [[ -f "/root/rl-swarm-backup/userApiKey.json" ]] && [[ -f "/root/rl-swarm-backup/userData.json" ]]; then
+            echo "    ✅ 备份文件存在"
+        else
+            echo "    ❌ 备份文件不存在"
+        fi
+    else
+        echo "  ✅ 身份文件正常"
+    fi
+    echo ""
+    
+    echo "严重错误检查:"
+    if check_critical_errors; then
+        echo "  ❌ 检测到严重错误"
+        echo "  最近错误日志:"
+        tail -50 "$LOG_FILE" | grep -E "ERROR|Error|Exception|Traceback|Failed|failed|InstantiationException|FileNotFoundError|>> An error was detected|>> Shutting down trainer" | tail -3 | sed 's/^/    /'
+    else
+        echo "  ✅ 无严重错误"
+    fi
+    echo ""
+    
+    echo "运行稳定性:"
+    if check_runtime_stability; then
+        echo "  ✅ 运行稳定"
+        local current_time=$(date +%s)
+        local last_startup_time=$(get_last_startup_time)
+        if [[ "$last_startup_time" != "0" ]]; then
+            local runtime=$((current_time - last_startup_time))
+            echo "  运行时长: ${runtime}秒 ($(($runtime / 60))分钟)"
+        fi
+    else
+        echo "  ❌ 运行不稳定"
+        echo "  可能原因: 频繁重启或启动后错误"
+    fi
+    echo "====================="
+}
+
+# 参数处理
+case "${1:-}" in
+    "debug")
+        debug_startup_info
+        exit 0
+        ;;
+    "status")
+        quick_status_check
+        exit 0
+        ;;
+    "copy-identity")
+        echo "=== 手动复制身份文件 ==="
+        if auto_copy_identity_files; then
+            echo "✅ 身份文件复制成功"
+        else
+            echo "❌ 身份文件复制失败"
+        fi
+        echo "=========================="
+        exit 0
+        ;;
+    "help")
+        echo "Gensyn Monitor 使用说明:"
+        echo ""
+        echo "  ./gensyn_monitor.sh          # 启动监控"
+        echo "  ./gensyn_monitor.sh status   # 快速状态检查"
+        echo "  ./gensyn_monitor.sh debug    # 启动时间调试信息"
+        echo "  ./gensyn_monitor.sh copy-identity  # 手动复制身份文件"
+        echo "  ./gensyn_monitor.sh help     # 显示此帮助信息"
+        echo ""
+        exit 0
+        ;;
+esac
+
+# 运行主函数
+main "$@" 

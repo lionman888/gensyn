@@ -1,0 +1,30 @@
+
+pkill -f gensyn_monitor.sh
+
+
+mkdir -p /root/gensyn-monitor
+cd /root/gensyn-monitor
+
+启动
+cd /root/gensyn-monitor
+chmod +x gensyn_monitor.sh
+screen -S gensyn_monitor
+./gensyn_monitor.sh
+
+
+# 查看最新的监控日志
+tail -10 /root/gensyn-monitor/monitor.log
+
+
+# 检查所有关键状态
+echo "=== Screen会话 ==="
+screen -list
+echo "=== 进程状态 ==="
+ps aux | grep -E "(python.*rgym|yarn.*start|gensyn_monitor)"
+echo "=== 监控状态 ==="
+cat /root/gensyn-monitor/monitor_state.json
+
+# 清理过大的日志文件
+find /root/rl-swarm/logs -name "*.log" -size +100M -exec truncate -s 50M {} \;
+find /root/gensyn-monitor -name "*.log" -size +100M -exec truncate -s 50M {} \;
+
