@@ -6,6 +6,9 @@
 
 set -e  # 遇到错误时退出
 
+# 获取脚本所在目录的绝对路径
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -160,12 +163,12 @@ copy_gensyn_monitor() {
     log_info "复制gensyn-monitor文件夹到root路径..."
     
     # 检查脚本同级目录下是否有gensyn-monitor文件夹
-    if [[ -d "./gensyn-monitor" ]]; then
-        cp -r "./gensyn-monitor" "/root/"
+    if [[ -d "${SCRIPT_DIR}/gensyn-monitor" ]]; then
+        cp -r "${SCRIPT_DIR}/gensyn-monitor" "/root/"
         chmod +x /root/gensyn-monitor/gensyn_monitor.sh
         log_success "已复制gensyn-monitor文件夹到/root/路径"
     else
-        log_error "未找到gensyn-monitor文件夹，请确保文件夹与此脚本在同一目录。"
+        log_error "未找到gensyn-monitor文件夹，请确保文件夹与此脚本在同一目录: ${SCRIPT_DIR}"
         exit 1
     fi
 }
@@ -192,14 +195,14 @@ replace_config() {
     log_info "替换配置文件..."
     
     # 检查脚本同级目录下是否有rg-swarm.yaml文件
-    if [[ -f "./rg-swarm.yaml" ]]; then
+    if [[ -f "${SCRIPT_DIR}/rg-swarm.yaml" ]]; then
         # 确保目标目录存在
         mkdir -p /root/rl-swarm/rgym_exp/config
         # 复制文件
-        cp "./rg-swarm.yaml" "/root/rl-swarm/rgym_exp/config/rg-swarm.yaml"
+        cp "${SCRIPT_DIR}/rg-swarm.yaml" "/root/rl-swarm/rgym_exp/config/rg-swarm.yaml"
         log_success "配置文件已替换"
     else
-        log_error "未找到rg-swarm.yaml文件，请确保文件与此脚本在同一目录。"
+        log_error "未找到rg-swarm.yaml文件，请确保文件与此脚本在同一目录: ${SCRIPT_DIR}"
         exit 1
     fi
 }
@@ -209,12 +212,12 @@ replace_startup_script() {
     log_info "替换启动脚本..."
     
     # 检查脚本同级目录下是否有run_rl_swarm.sh文件
-    if [[ -f "./run_rl_swarm.sh" ]]; then
-        cp "./run_rl_swarm.sh" "/root/rl-swarm/"
+    if [[ -f "${SCRIPT_DIR}/run_rl_swarm.sh" ]]; then
+        cp "${SCRIPT_DIR}/run_rl_swarm.sh" "/root/rl-swarm/"
         chmod +x /root/rl-swarm/run_rl_swarm.sh
         log_success "启动脚本已替换"
     else
-        log_error "未找到run_rl_swarm.sh文件，请确保文件与此脚本在同一目录。"
+        log_error "未找到run_rl_swarm.sh文件，请确保文件与此脚本在同一目录: ${SCRIPT_DIR}"
         exit 1
     fi
 }
