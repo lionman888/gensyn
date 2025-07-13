@@ -347,7 +347,7 @@ setup_and_start() {
         return 1
     fi
     
-    # 创建并激活Python虚拟环境
+    # 创建Python虚拟环境
     cd /root/rl-swarm || {
         log_error "无法切换到/root/rl-swarm目录"
         return 1
@@ -362,51 +362,60 @@ setup_and_start() {
         }
     }
     
+    # 确保run_rl_swarm.sh可执行
+    chmod +x /root/rl-swarm/run_rl_swarm.sh || {
+        log_warning "无法设置脚本可执行权限"
+    }
+    
     log_success "环境设置完成，准备启动脚本。"
     
     echo -e "${GREEN}==========================================================${NC}"
     echo -e "${GREEN}Gensyn一键部署已完成！${NC}"
     echo -e "${GREEN}==========================================================${NC}"
-    echo -e "${YELLOW}请使用以下命令启动程序：${NC}"
-    echo -e "${BLUE}cd${NC}"
-    echo -e "${BLUE}screen -S gensyn${NC}"
-    echo -e "${BLUE}cd rl-swarm${NC}"
-    echo -e "${BLUE}source myenv/bin/activate${NC}"
-    echo -e "${BLUE}chmod +x run_rl_swarm.sh${NC}"
-    echo -e "${BLUE}./run_rl_swarm.sh${NC}"
-    echo -e "${GREEN}==========================================================${NC}"
     
-    # 自动选择启动，无需询问
-    # read -p "是否立即启动程序？(y/n): " start_now
-    start_now="y"
-    
-    if [[ "$start_now" == "y" ]] || [[ "$start_now" == "Y" ]]; then
-        log_info "正在启动程序..."
-        
-        # 检查screen是否安装
-        if ! command -v screen &> /dev/null; then
-            log_warning "screen未安装，尝试安装..."
-            apt install -y screen || {
-                log_error "无法安装screen，请手动启动程序"
-                return 1
-            }
-        fi
-        
-        # 确保没有同名会话
-        screen -wipe &>/dev/null || true
-        screen -S gensyn -X quit &>/dev/null || true
-        
-        cd || {
-            log_warning "无法切换到主目录，但将继续执行"
-        }
-        
-        screen -dmS gensyn bash -c "cd /root/rl-swarm && source myenv/bin/activate && chmod +x run_rl_swarm.sh && ./run_rl_swarm.sh" || {
-            log_error "启动screen会话失败"
+    # 检查screen是否安装
+    if ! command -v screen &> /dev/null; then
+        log_warning "screen未安装，尝试安装..."
+        apt install -y screen || {
+            log_error "无法安装screen，请手动启动程序"
             return 1
         }
-        
-        log_success "程序已在screen会话中启动，使用 'screen -r gensyn' 命令查看。"
-    fi
+    }
+    
+    # 确保没有同名会话
+    screen -wipe &>/dev/null || true
+    screen -S gensyn -X quit &>/dev/null || true
+    
+    # 创建启动脚本
+    cat > /root/start_gensyn.sh << EOF
+#!/bin/bash
+cd
+cd rl-swarm
+source myenv/bin/activate
+chmod +x run_rl_swarm.sh
+./run_rl_swarm.sh
+EOF
+    
+    # 赋予执行权限
+    chmod +x /root/start_gensyn.sh
+    
+    # 使用screen启动
+    cd || {
+        log_warning "无法切换到主目录，但将继续执行"
+    }
+    
+    log_info "正在启动程序..."
+    screen -dmS gensyn bash /root/start_gensyn.sh || {
+        log_error "启动screen会话失败"
+        return 1
+    }
+    
+    log_success "程序已在screen会话中启动，使用 'screen -r gensyn' 命令查看。"
+    echo -e "${GREEN}==========================================================${NC}"
+    echo -e "${YELLOW}启动命令已执行，程序正在运行中...${NC}"
+    echo -e "${YELLOW}使用以下命令查看运行状态：${NC}"
+    echo -e "${BLUE}screen -r gensyn${NC}"
+    echo -e "${GREEN}==========================================================${NC}"
     
     return 0
 }
