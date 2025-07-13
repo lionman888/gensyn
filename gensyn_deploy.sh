@@ -330,7 +330,8 @@ copy_certificate() {
     else
         log_warning "未找到证书文件，请手动上传。"
         echo -e "${YELLOW}请在启动前将swarm.pem证书文件上传至/root/rl-swarm/目录。${NC}"
-        read -p "按Enter键继续..."
+        # 移除交互式等待
+        # read -p "按Enter键继续..."
     fi
     
     return 0
@@ -375,8 +376,9 @@ setup_and_start() {
     echo -e "${BLUE}./run_rl_swarm.sh${NC}"
     echo -e "${GREEN}==========================================================${NC}"
     
-    # 询问用户是否立即启动
-    read -p "是否立即启动程序？(y/n): " start_now
+    # 自动选择启动，无需询问
+    # read -p "是否立即启动程序？(y/n): " start_now
+    start_now="y"
     
     if [[ "$start_now" == "y" ]] || [[ "$start_now" == "Y" ]]; then
         log_info "正在启动程序..."
@@ -418,8 +420,9 @@ main() {
     # 检查是否为root用户
     check_root
     
-    # 询问用户是否继续
-    read -p "此脚本将在当前系统上部署Gensyn环境，是否继续？(y/n): " continue_setup
+    # 自动继续，无需询问
+    # read -p "此脚本将在当前系统上部署Gensyn环境，是否继续？(y/n): " continue_setup
+    continue_setup="y"
     
     if [[ "$continue_setup" != "y" ]] && [[ "$continue_setup" != "Y" ]]; then
         log_info "用户取消安装，退出脚本。"
