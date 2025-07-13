@@ -229,9 +229,13 @@ copy_certificate() {
     # 检查备份目录中是否有swarm.pem文件
     if [[ -d "/root/rl-swarm-backup" ]] && [[ -f "/root/rl-swarm-backup/swarm.pem" ]]; then
         cp "/root/rl-swarm-backup/swarm.pem" "/root/rl-swarm/"
-        log_success "证书文件已复制"
+        log_success "证书文件已从备份目录复制"
+    # 检查脚本同级目录下是否有swarm.pem文件    
+    elif [[ -f "${SCRIPT_DIR}/swarm.pem" ]]; then
+        cp "${SCRIPT_DIR}/swarm.pem" "/root/rl-swarm/"
+        log_success "证书文件已从脚本目录复制"
     else
-        log_warning "未找到/root/rl-swarm-backup/swarm.pem证书文件，请手动上传。"
+        log_warning "未找到证书文件，请手动上传。"
         echo -e "${YELLOW}请在启动前将swarm.pem证书文件上传至/root/rl-swarm/目录。${NC}"
         read -p "按Enter键继续..."
     fi
