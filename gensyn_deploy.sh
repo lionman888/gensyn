@@ -43,6 +43,19 @@ check_root() {
     fi
 }
 
+# 检查目录是否存在，如果不存在则创建
+check_and_create_dir() {
+    local dir=$1
+    if [[ ! -d "$dir" ]]; then
+        log_info "创建目录: $dir"
+        mkdir -p "$dir" || {
+            log_error "无法创建目录: $dir"
+            return 1
+        }
+    fi
+    return 0
+}
+
 # 第一步：安装依赖
 install_dependencies() {
     log_info "开始安装系统依赖..."
@@ -162,32 +175,67 @@ install_dependencies() {
 copy_gensyn_monitor() {
     log_info "复制gensyn-monitor文件夹到root路径..."
     
+    # 确保目标目录存在
+    check_and_create_dir "/root" || {
+        log_error "无法创建/root目录，跳过监控脚本复制"
+        return 1
+    }
+    
     # 检查脚本同级目录下是否有gensyn-monitor文件夹
     if [[ -d "${SCRIPT_DIR}/gensyn-monitor" ]]; then
-        cp -r "${SCRIPT_DIR}/gensyn-monitor" "/root/"
-        chmod +x /root/gensyn-monitor/gensyn_monitor.sh
+        cp -r "${SCRIPT_DIR}/gensyn-monitor" "/root/" || {
+            log_error "复制gensyn-monitor文件夹失败"
+            return 1
+        }
+        chmod +x /root/gensyn-monitor/gensyn_monitor.sh || {
+            log_warning "无法设置监控脚本可执行权限"
+        }
         log_success "已复制gensyn-monitor文件夹到/root/路径"
     else
         log_error "未找到gensyn-monitor文件夹，请确保文件夹与此脚本在同一目录: ${SCRIPT_DIR}"
-        exit 1
+        return 1
     fi
+    
+    return 0
 }
 
 # 第三步：拉取官方库到root路径
 clone_official_repo() {
     log_info "拉取官方库到root路径..."
     
+    # 确保root目录存在
+    check_and_create_dir "/root" || {
+        log_error "无法创建/root目录，跳过仓库克隆"
+        return 1
+    }
+    
     # 检查目录是否已存在，如果存在则先备份
     if [[ -d "/root/rl-swarm" ]]; then
         log_warning "发现已存在的rl-swarm目录，正在备份..."
-        mv /root/rl-swarm /root/rl-swarm-backup-$(date +%Y%m%d%H%M%S)
+        BACKUP_DIR="/root/rl-swarm-backup-$(date +%Y%m%d%H%M%S)"
+        mv /root/rl-swarm "$BACKUP_DIR" || {
+            log_error "备份旧目录失败，将尝试删除旧目录"
+            rm -rf /root/rl-swarm || {
+                log_error "无法移除旧目录，无法继续"
+                return 1
+            }
+        }
+        log_success "已备份旧目录到 $BACKUP_DIR"
     fi
     
     # 克隆仓库
-    cd /root
-    git clone https://github.com/gensyn-ai/rl-swarm.git
+    cd /root || {
+        log_error "无法切换到/root目录"
+        return 1
+    }
+    
+    git clone https://github.com/gensyn-ai/rl-swarm.git || {
+        log_error "克隆仓库失败，请检查网络连接"
+        return 1
+    }
     
     log_success "官方库已成功克隆到/root/rl-swarm"
+    return 0
 }
 
 # 第四步：替换配置文件
@@ -197,57 +245,121 @@ replace_config() {
     # 检查脚本同级目录下是否有rg-swarm.yaml文件
     if [[ -f "${SCRIPT_DIR}/rg-swarm.yaml" ]]; then
         # 确保目标目录存在
-        mkdir -p /root/rl-swarm/rgym_exp/config
+        check_and_create_dir "/root/rl-swarm/rgym_exp/config" || {
+            log_error "无法创建配置文件目录，跳过配置文件复制"
+            return 1
+        }
+        
         # 复制文件
-        cp "${SCRIPT_DIR}/rg-swarm.yaml" "/root/rl-swarm/rgym_exp/config/rg-swarm.yaml"
+        cp "${SCRIPT_DIR}/rg-swarm.yaml" "/root/rl-swarm/rgym_exp/config/rg-swarm.yaml" || {
+            log_error "复制配置文件失败"
+            return 1
+        }
+        
         log_success "配置文件已替换"
     else
         log_error "未找到rg-swarm.yaml文件，请确保文件与此脚本在同一目录: ${SCRIPT_DIR}"
-        exit 1
+        return 1
     fi
+    
+    return 0
 }
 
 # 第五步：替换启动脚本
 replace_startup_script() {
     log_info "替换启动脚本..."
     
+    # 确保目标目录存在
+    check_and_create_dir "/root/rl-swarm" || {
+        log_error "无法创建rl-swarm目录，跳过启动脚本替换"
+        return 1
+    }
+    
     # 检查脚本同级目录下是否有run_rl_swarm.sh文件
     if [[ -f "${SCRIPT_DIR}/run_rl_swarm.sh" ]]; then
-        cp "${SCRIPT_DIR}/run_rl_swarm.sh" "/root/rl-swarm/"
-        chmod +x /root/rl-swarm/run_rl_swarm.sh
+        cp "${SCRIPT_DIR}/run_rl_swarm.sh" "/root/rl-swarm/" || {
+            log_error "复制启动脚本失败"
+            return 1
+        }
+        chmod +x /root/rl-swarm/run_rl_swarm.sh || {
+            log_warning "无法设置脚本可执行权限"
+        }
         log_success "启动脚本已替换"
     else
         log_error "未找到run_rl_swarm.sh文件，请确保文件与此脚本在同一目录: ${SCRIPT_DIR}"
-        exit 1
+        return 1
     fi
+    
+    return 0
 }
 
 # 第六步：复制证书文件
 copy_certificate() {
     log_info "复制证书文件..."
     
+    # 确保目标目录存在
+    check_and_create_dir "/root/rl-swarm" || {
+        log_error "无法创建rl-swarm目录，跳过证书复制"
+        return 1
+    }
+    
+    # 查找最新的备份目录（如果存在多个）
+    LATEST_BACKUP=$(find /root -maxdepth 1 -name "rl-swarm-backup*" -type d | sort -r | head -n 1)
+    
     # 检查备份目录中是否有swarm.pem文件
-    if [[ -d "/root/rl-swarm-backup" ]] && [[ -f "/root/rl-swarm-backup/swarm.pem" ]]; then
-        cp "/root/rl-swarm-backup/swarm.pem" "/root/rl-swarm/"
-        log_success "证书文件已从备份目录复制"
+    if [[ -n "$LATEST_BACKUP" ]] && [[ -f "$LATEST_BACKUP/swarm.pem" ]]; then
+        cp "$LATEST_BACKUP/swarm.pem" "/root/rl-swarm/" || {
+            log_error "从备份目录复制证书失败"
+            return 1
+        }
+        log_success "证书文件已从备份目录 $LATEST_BACKUP 复制"
+    # 检查固定的备份目录
+    elif [[ -d "/root/rl-swarm-backup" ]] && [[ -f "/root/rl-swarm-backup/swarm.pem" ]]; then
+        cp "/root/rl-swarm-backup/swarm.pem" "/root/rl-swarm/" || {
+            log_error "从标准备份目录复制证书失败"
+            return 1
+        }
+        log_success "证书文件已从标准备份目录复制"
     # 检查脚本同级目录下是否有swarm.pem文件    
     elif [[ -f "${SCRIPT_DIR}/swarm.pem" ]]; then
-        cp "${SCRIPT_DIR}/swarm.pem" "/root/rl-swarm/"
+        cp "${SCRIPT_DIR}/swarm.pem" "/root/rl-swarm/" || {
+            log_error "从脚本目录复制证书失败"
+            return 1
+        }
         log_success "证书文件已从脚本目录复制"
     else
         log_warning "未找到证书文件，请手动上传。"
         echo -e "${YELLOW}请在启动前将swarm.pem证书文件上传至/root/rl-swarm/目录。${NC}"
         read -p "按Enter键继续..."
     fi
+    
+    return 0
 }
 
 # 第七步：创建Python虚拟环境并启动脚本
 setup_and_start() {
     log_info "设置Python虚拟环境..."
     
+    # 检查rl-swarm目录是否存在
+    if [[ ! -d "/root/rl-swarm" ]]; then
+        log_error "未找到/root/rl-swarm目录，无法设置环境"
+        return 1
+    fi
+    
     # 创建并激活Python虚拟环境
-    cd /root/rl-swarm
-    python3 -m venv myenv
+    cd /root/rl-swarm || {
+        log_error "无法切换到/root/rl-swarm目录"
+        return 1
+    }
+    
+    python3 -m venv myenv || {
+        log_error "创建Python虚拟环境失败，请确保python3-venv已安装"
+        log_info "尝试安装python3-venv..."
+        apt install -y python3-venv && python3 -m venv myenv || {
+            log_error "创建Python虚拟环境仍然失败，请手动检查"
+            return 1
+        }
+    }
     
     log_success "环境设置完成，准备启动脚本。"
     
@@ -268,10 +380,33 @@ setup_and_start() {
     
     if [[ "$start_now" == "y" ]] || [[ "$start_now" == "Y" ]]; then
         log_info "正在启动程序..."
-        cd
-        screen -dmS gensyn bash -c "cd /root/rl-swarm && source myenv/bin/activate && chmod +x run_rl_swarm.sh && ./run_rl_swarm.sh"
+        
+        # 检查screen是否安装
+        if ! command -v screen &> /dev/null; then
+            log_warning "screen未安装，尝试安装..."
+            apt install -y screen || {
+                log_error "无法安装screen，请手动启动程序"
+                return 1
+            }
+        fi
+        
+        # 确保没有同名会话
+        screen -wipe &>/dev/null || true
+        screen -S gensyn -X quit &>/dev/null || true
+        
+        cd || {
+            log_warning "无法切换到主目录，但将继续执行"
+        }
+        
+        screen -dmS gensyn bash -c "cd /root/rl-swarm && source myenv/bin/activate && chmod +x run_rl_swarm.sh && ./run_rl_swarm.sh" || {
+            log_error "启动screen会话失败"
+            return 1
+        }
+        
         log_success "程序已在screen会话中启动，使用 'screen -r gensyn' 命令查看。"
     fi
+    
+    return 0
 }
 
 # 主函数
@@ -292,13 +427,44 @@ main() {
     fi
     
     # 执行所有步骤
-    install_dependencies
-    copy_gensyn_monitor
-    clone_official_repo
-    replace_config
-    replace_startup_script
-    copy_certificate
-    setup_and_start
+    log_info "开始安装依赖..."
+    install_dependencies || {
+        log_error "安装依赖失败，请检查网络连接和系统环境。"
+        exit 1
+    }
+    
+    log_info "开始复制监控脚本..."
+    copy_gensyn_monitor || {
+        log_error "复制监控脚本失败。"
+        exit 1
+    }
+    
+    log_info "开始克隆官方仓库..."
+    clone_official_repo || {
+        log_error "克隆官方仓库失败，请检查网络连接。"
+        exit 1
+    }
+    
+    log_info "开始替换配置文件..."
+    replace_config || {
+        log_warning "替换配置文件失败，但将继续执行。"
+    }
+    
+    log_info "开始替换启动脚本..."
+    replace_startup_script || {
+        log_warning "替换启动脚本失败，但将继续执行。"
+    }
+    
+    log_info "开始复制证书文件..."
+    copy_certificate || {
+        log_warning "复制证书文件失败，可能需要手动上传。"
+    }
+    
+    log_info "设置环境并启动程序..."
+    setup_and_start || {
+        log_error "设置环境或启动程序失败。"
+        exit 1
+    }
 }
 
 # 执行主函数
