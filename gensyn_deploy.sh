@@ -380,7 +380,7 @@ setup_and_start() {
             log_error "无法安装screen，请手动启动程序"
             return 1
         }
-    }
+    fi
     
     # 确保没有同名会话
     screen -wipe &>/dev/null || true
