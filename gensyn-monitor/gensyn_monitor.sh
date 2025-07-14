@@ -354,17 +354,17 @@ check_training_progress() {
         local current_time=$(date +%s)
         local last_startup_time=$(get_last_startup_time)
         
-        # 检查监控脚本是否刚启动（给5分钟宽松期）
+        # 检查监控脚本是否刚启动（给10分钟宽松期）
         local state=$(load_state)
         local monitor_start_time=$(echo "$state" | grep -oP '"last_restart_time":\s*"\K[^"]*')
         if [[ -n "$monitor_start_time" ]]; then
             local monitor_timestamp=$(date -d "$monitor_start_time" +%s 2>/dev/null || echo "0")
             local monitor_running_time=$((current_time - monitor_timestamp))
             
-            # 如果监控脚本运行不到5分钟，使用宽松检查
-            if [[ $monitor_running_time -lt 300 ]]; then
+            # 如果监控脚本运行不到10分钟，使用宽松检查
+            if [[ $monitor_running_time -lt 600 ]]; then
                 log_info "监控脚本刚启动，使用宽松的训练进度检查"
-                local recent_logs=$(tail -100 "$LOG_FILE" | grep -E "Starting round|Joining round|🐝 Joining round|Already finished round" | tail -5)
+                local recent_logs=$(tail -100 "$LOG_FILE" | grep -E "Starting round|Joining round|🐝 Joining round|Already finished round|model broadcast" | tail -5)
                 if [[ -n "$recent_logs" ]]; then
                     return 0  # 有训练相关日志，认为正常
                 fi
@@ -374,7 +374,7 @@ check_training_progress() {
         
         # 如果无法获取启动时间，使用传统检查方式
         if [[ "$last_startup_time" == "0" ]]; then
-            local recent_logs=$(tail -100 "$LOG_FILE" | grep -E "Starting round|Joining round|🐝 Joining round" | tail -5)
+            local recent_logs=$(tail -200 "$LOG_FILE" | grep -E "Starting round|Joining round|🐝 Joining round|model broadcast|Learning rate|training examples" | tail -5)
             if [[ -n "$recent_logs" ]]; then
                 return 0  # 有训练日志，认为正常
             fi
@@ -385,14 +385,15 @@ check_training_progress() {
         local startup_date=$(date -d "@$last_startup_time" '+%Y-%m-%d %H:%M:%S')
         log_info "检查训练进度：启动时间 $startup_date 之后的训练日志"
         
-        # 使用awk来获取启动时间之后的训练日志
+        # 使用更广泛的训练日志模式匹配
         local training_logs_after_startup=$(awk -v start_time="$startup_date" '
             BEGIN { found = 0 }
-            $0 ~ /Starting round|Joining round|🐝 Joining round/ && $0 >= start_time { found = 1 }
-            found && /Starting round|Joining round|🐝 Joining round/ { print }
-        ' "$LOG_FILE" | tail -5)
+            $0 >= start_time { found = 1 }
+            found && /Starting round|Joining round|🐝 Joining round|model broadcast|Learning rate|training examples|evaluation|reward/ { print }
+        ' "$LOG_FILE" | tail -10)
         
-        log_info "找到 $(echo "$training_logs_after_startup" | wc -l) 条启动后的训练日志"
+        local log_count=$(echo "$training_logs_after_startup" | grep -c .)
+        log_info "找到 $log_count 条启动后的训练日志"
         
         if [[ -n "$training_logs_after_startup" ]]; then
             # 检查最后一条训练日志的时间
@@ -403,20 +404,37 @@ check_training_progress() {
                 local log_timestamp=$(date -d "$log_time" +%s 2>/dev/null || echo "0")
                 local time_diff=$((current_time - log_timestamp))
                 
-                # 如果最后一条训练日志在30分钟内，认为训练正常（放宽时间限制）
-                if [[ $time_diff -lt 1800 ]]; then
+                # 根据不同条件调整超时阈值
+                local timeout_threshold=1800  # 默认30分钟
+                
+                # 如果程序刚启动（30分钟内），给更长的超时
+                local program_uptime=$((current_time - last_startup_time))
+                if [[ $program_uptime -lt 1800 ]]; then
+                    timeout_threshold=3600  # 给1小时宽限期
+                fi
+                
+                # 如果最后一条训练日志在超时阈值内，认为训练正常
+                if [[ $time_diff -lt $timeout_threshold ]]; then
                     log_info "最后训练日志时间差: ${time_diff}秒，训练正常"
                     return 0  # 训练正常
                 else
-                    log_warn "最后训练日志时间差: ${time_diff}秒，超过30分钟阈值"
+                    log_warn "最后训练日志时间差: ${time_diff}秒，超过${timeout_threshold}秒阈值"
+                    
+                    # 检查是否可能是有效等待（例如正在等待其他节点）
+                    if tail -50 "$LOG_FILE" | grep -qE "Waiting for other peers|Waiting for round to complete|Waiting for next round"; then
+                        log_info "检测到正在等待其他节点，这可能是正常的"
+                        return 0  # 认为训练正常
+                    fi
                 fi
             fi
+        else
+            log_warn "未找到有效的训练日志记录"
         fi
         
         # 检查最近启动后是否有"Already finished round"日志
         local finished_logs_after_startup=$(awk -v start_time="$startup_date" '
             BEGIN { found = 0 }
-            $0 ~ /Already finished round/ && $0 >= start_time { found = 1 }
+            $0 >= start_time { found = 1 }
             found && /Already finished round/ { print }
         ' "$LOG_FILE" | tail -10)
         
@@ -429,13 +447,39 @@ check_training_progress() {
                 local log_timestamp=$(date -d "$log_time" +%s 2>/dev/null || echo "0")
                 local time_diff=$((current_time - log_timestamp))
                 
-                # 如果最后一条完成日志在30分钟内，也认为是正常的（放宽时间限制）
+                # 如果最后一条完成日志在30分钟内，也认为是正常的
                 if [[ $time_diff -lt 1800 ]]; then
+                    log_info "检测到'Already finished round'日志，时间差: ${time_diff}秒，训练正常"
                     return 0  # 训练正常
                 fi
             fi
         fi
+        
+        # 检查是否有其他指示训练活动的日志
+        local other_activity=$(awk -v start_time="$startup_date" '
+            BEGIN { found = 0 }
+            $0 >= start_time { found = 1 }
+            found && /Connected peers|Online peers|Model ready|评估完成|正在训练|training|模型更新|evaluating/ { print }
+        ' "$LOG_FILE" | tail -5)
+        
+        if [[ -n "$other_activity" ]]; then
+            local last_activity=$(echo "$other_activity" | tail -1)
+            local log_time=$(echo "$last_activity" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
+            
+            if [[ -n "$log_time" ]]; then
+                local log_timestamp=$(date -d "$log_time" +%s 2>/dev/null || echo "0")
+                local time_diff=$((current_time - log_timestamp))
+                
+                if [[ $time_diff -lt 900 ]]; then  # 15分钟内有其他活动
+                    log_info "检测到训练相关活动，时间差: ${time_diff}秒，训练可能正常"
+                    return 0
+                fi
+            fi
+        fi
     fi
+    
+    # 如果所有检查都失败，训练异常
+    log_warn "训练进度检查失败，未检测到最近的训练活动"
     return 1  # 训练异常
 }
 
@@ -443,32 +487,52 @@ check_training_progress() {
 check_critical_errors() {
     if [[ -f "$LOG_FILE" ]]; then
         # 检查最近的严重错误
-        if tail -50 "$LOG_FILE" | grep -qE "OutOfMemoryError|MemoryError|Fatal|Segmentation fault|killed"; then
+        if tail -100 "$LOG_FILE" | grep -qE "OutOfMemoryError|MemoryError|Fatal|Segmentation fault|killed"; then
+            log_error "检测到内存错误或段错误"
             return 0  # 发现严重错误
         fi
         
         # 检查Hydra相关错误
-        if tail -50 "$LOG_FILE" | grep -qE "hydra\.errors\.InstantiationException|Error in call to target|FileNotFoundError.*No such file or directory"; then
+        if tail -100 "$LOG_FILE" | grep -qE "hydra\.errors\.InstantiationException|Error in call to target|FileNotFoundError.*No such file or directory"; then
             log_error "检测到Hydra配置或文件缺失错误"
             return 0  # 发现配置错误
         fi
         
-        # 检查Python运行时错误
-        if tail -50 "$LOG_FILE" | grep -qE "Traceback \(most recent call last\)|ModuleNotFoundError|ImportError|AttributeError"; then
+        # 检查Python运行时错误 - 扩展检测范围
+        if tail -100 "$LOG_FILE" | grep -qE "Traceback \(most recent call last\)|ModuleNotFoundError|ImportError|AttributeError|TypeError|ValueError|IndexError|KeyError|RuntimeError|SystemError"; then
             log_error "检测到Python运行时错误"
+            
+            # 提取错误信息
+            local error_detail=$(tail -100 "$LOG_FILE" | grep -A 10 -B 2 "Traceback \|Error\|Exception" | head -12)
+            if [[ -n "$error_detail" ]]; then
+                log_error "错误详情: $(echo "$error_detail" | head -1)..."
+            fi
+            
             return 0  # 发现Python错误
         fi
         
         # 检查进程意外退出
-        if tail -50 "$LOG_FILE" | grep -qE "Terminated|Killed|Process finished with exit code|KeyboardInterrupt"; then
+        if tail -100 "$LOG_FILE" | grep -qE "Terminated|Killed|Process finished with exit code|KeyboardInterrupt|ExitStack"; then
             log_error "检测到进程意外退出"
             return 0  # 发现进程退出
         fi
         
         # 检查rl-swarm特定错误
-        if tail -50 "$LOG_FILE" | grep -qE ">> An error was detected while running rl-swarm|>> Shutting down trainer"; then
+        if tail -100 "$LOG_FILE" | grep -qE ">> An error was detected while running rl-swarm|>> Shutting down trainer|Failed to join thread"; then
             log_error "检测到rl-swarm系统错误或训练器关闭"
             return 0  # 发现系统错误
+        fi
+        
+        # 检查网络和连接错误
+        if tail -100 "$LOG_FILE" | grep -qE "ConnectionRefusedError|ConnectionError|TimeoutError|ConnectTimeout|ConnectionResetError"; then
+            log_error "检测到网络连接错误"
+            return 0  # 发现网络错误
+        fi
+        
+        # 检查资源限制错误
+        if tail -100 "$LOG_FILE" | grep -qE "Resource temporarily unavailable|Cannot allocate memory|Too many open files"; then
+            log_error "检测到系统资源限制错误"
+            return 0  # 发现资源错误
         fi
     fi
     return 1  # 没有严重错误
@@ -1120,10 +1184,26 @@ main_monitor_loop() {
 
 cleanup() {
     log_info "监控脚本正在退出..."
-    exit 0
+    
+    # 防止重复执行cleanup
+    trap "" SIGINT SIGTERM EXIT
+    
+    # 保存当前状态
+    local state=$(load_state)
+    local peer_name=$(echo "$state" | grep -oP '"peer_name":\s*"\K[^"]*')
+    local last_score=$(echo "$state" | grep -oP '"last_score":\s*"\K[^"]*')
+    local last_reward=$(echo "$state" | grep -oP '"last_reward":\s*"\K[^"]*')
+    local last_check_time=$(echo "$state" | grep -oP '"last_check_time":\s*"\K[^"]*')
+    local unchanged_count=$(echo "$state" | grep -oP '"unchanged_count":\s*\K[0-9]+')
+    local startup_time=$(echo "$state" | grep -oP '"last_startup_time":\s*"\K[^"]*')
+    
+    save_state "$peer_name" "$last_score" "$(date '+%Y-%m-%d %H:%M:%S')" "$unchanged_count" "$last_reward" "$startup_time"
+    
+    log_info "状态已保存，监控脚本退出完成"
 }
 
-trap cleanup EXIT SIGINT SIGTERM
+# 只捕获用户主动发出的SIGINT和SIGTERM信号
+trap cleanup SIGINT SIGTERM EXIT
 
 # =============================================================================
 # 主函数
@@ -1145,8 +1225,229 @@ main() {
         exit 1
     fi
     
+    # 标记是否应该退出
+    local should_exit=false
+    
+    # 重新定义局部的信号处理函数
+    trap "should_exit=true; log_info '接收到退出信号，等待当前操作完成后退出...'" SIGINT SIGTERM
+    
     # 开始主监控循环
-    main_monitor_loop
+    main_monitor_loop_with_exit_check
+    
+    # 如果被标记为退出，则正常退出
+    if [ "$should_exit" = true ]; then
+        log_info "监控脚本正常退出"
+        # cleanup函数会由EXIT陷阱自动调用
+    else
+        log_info "监控循环结束，监控脚本退出"
+    fi
+}
+
+# 修改后的主监控循环，带有退出检查
+main_monitor_loop_with_exit_check() {
+    log_info "开始主监控循环 (带退出检查)"
+    
+    local last_health_check=0
+    local last_score_check=0
+    local last_p2p_check=0
+    
+    while true; do
+        # 检查是否应该退出
+        if [ "$should_exit" = true ]; then
+            log_info "监控循环收到退出请求，结束循环"
+            return
+        fi
+        
+        local current_time=$(date +%s)
+        
+        # 健康检查
+        if [[ $((current_time - last_health_check)) -ge $HEALTH_CHECK_INTERVAL ]]; then
+            local startup_time=$(get_last_startup_time)
+            log_info "检查训练进度：启动时间 $(date -d "@$startup_time" '+%Y-%m-%d %H:%M:%S' 2>/dev/null) 之后的训练日志"
+            
+            # 确保当前没有正在处理的修复操作
+            local is_repairing=false
+            
+            if ! health_check; then
+                log_warn "健康检查失败，尝试修复"
+                is_repairing=true
+                
+                # 记录当前的should_exit值，确保在修复过程中不会退出
+                local original_should_exit=$should_exit
+                
+                # 临时忽略SIGINT和SIGTERM信号，防止重启过程被中断
+                trap "" SIGINT SIGTERM
+                
+                # 检查具体失败原因并采取相应措施
+                if check_p2p_error; then
+                    log_info "健康检查失败原因：P2P连接错误，启动专门的P2P修复流程"
+                    
+                    # P2P错误专门处理
+                    local p2p_retry_count=0
+                    local max_p2p_retries=10  # 给更多重试机会
+                    
+                    while [[ $p2p_retry_count -lt $max_p2p_retries ]]; do
+                        p2p_retry_count=$((p2p_retry_count + 1))
+                        log_warn "P2P错误修复尝试 ${p2p_retry_count}/${max_p2p_retries}"
+                        
+                        restart_in_screen
+                        
+                        # 给P2P连接更多时间
+                        local p2p_wait=0
+                        local p2p_fixed=false
+                        
+                        while [[ $p2p_wait -lt 180 ]]; do  # 等待3分钟
+                            sleep 30
+                            p2p_wait=$((p2p_wait + 30))
+                            
+                            # 优先检查身份文件问题（可能导致P2P错误的根本原因）
+                            if check_identity_stuck; then
+                                log_info "P2P错误期间发现身份文件问题，优先修复身份文件"
+                                if auto_copy_identity_files; then
+                                    log_info "身份文件已修复，继续等待P2P连接"
+                                    sleep 60  # 给身份文件处理时间
+                                fi
+                            fi
+                            
+                            if ! check_p2p_error; then
+                                log_info "P2P错误已修复！"
+                                p2p_fixed=true
+                                break
+                            else
+                                log_warn "P2P错误仍存在，继续等待... ($p2p_wait/180秒)"
+                            fi
+                        done
+                        
+                        if [[ "$p2p_fixed" == "true" ]]; then
+                            break
+                        fi
+                    done
+                    
+                    if [[ $p2p_retry_count -ge $max_p2p_retries ]]; then
+                        log_error "P2P错误修复失败，已尝试 $max_p2p_retries 次"
+                        send_telegram_message "P2P连接持续错误，已尝试修复 $max_p2p_retries 次，需要人工处理"
+                    fi
+                    
+                else
+                    # 非P2P错误的常规处理
+                    log_info "健康检查失败原因：非P2P错误，进行常规重启"
+                    
+                    if check_screen_session; then
+                        restart_in_screen
+                    else
+                        create_screen_session
+                    fi
+                    
+                    # 重启后进入恢复期
+                    log_info "重启完成，进入10分钟恢复期..."
+                    local recovery_start=$(date +%s)
+                    
+                    while true; do
+                        local recovery_elapsed=$(($(date +%s) - recovery_start))
+                        
+                        if [[ $recovery_elapsed -gt 600 ]]; then  # 10分钟恢复期
+                            log_warn "恢复期结束，继续正常监控"
+                            break
+                        fi
+                        
+                        # 每60秒检查一次恢复状态
+                        if [[ $((recovery_elapsed % 60)) -eq 0 ]]; then
+                            log_info "恢复期状态检查：已过 $recovery_elapsed 秒"
+                            
+                            # 在恢复期内，优先检查P2P错误
+                            if check_p2p_error; then
+                                log_warn "恢复期发现P2P错误，重新启动"
+                                restart_in_screen
+                                sleep 60
+                            elif check_identity_stuck; then
+                                log_warn "恢复期发现身份文件卡住，尝试修复"
+                                if auto_copy_identity_files; then
+                                    log_info "恢复期：身份文件已修复，等待程序处理"
+                                    sleep 120  # 等待2分钟让程序处理身份文件
+                                else
+                                    log_error "恢复期：身份文件修复失败"
+                                fi
+                            elif check_startup_success; then
+                                log_info "恢复期检查：程序已成功启动"
+                                # 不立即退出恢复期，让程序稳定运行一段时间
+                            fi
+                        fi
+                        
+                        sleep 30  # 每30秒检查一次
+                    done
+                fi
+                
+                # 恢复SIGINT和SIGTERM信号处理
+                trap "should_exit=true; log_info '接收到退出信号，等待当前操作完成后退出...'" SIGINT SIGTERM
+                
+                # 恢复原始的should_exit值，确保我们没有忽略掉退出请求
+                should_exit=$original_should_exit
+                is_repairing=false
+            fi
+            
+            last_health_check=$current_time
+            
+            # 如果修复操作结束后应该退出
+            if [ "$should_exit" = true ] && [ "$is_repairing" = false ]; then
+                log_info "健康检查后收到退出请求，结束循环"
+                return
+            fi
+        fi
+        
+        # 查分检查
+        if [[ $((current_time - last_score_check)) -ge $SCORE_CHECK_INTERVAL ]]; then
+            local state=$(load_state)
+            local peer_name=$(echo "$state" | grep -oP '"peer_name":\s*"\K[^"]*')
+            
+            # 记录当前的should_exit值
+            local original_should_exit=$should_exit
+            
+            if [[ -n "$peer_name" ]]; then
+                if ! check_score_change "$peer_name"; then
+                    log_warn "分数检查触发重启"
+                    
+                    # 临时忽略SIGINT和SIGTERM信号，防止重启过程被中断
+                    trap "" SIGINT SIGTERM
+                    
+                    restart_in_screen
+                    sleep 30
+                    
+                    # 恢复SIGINT和SIGTERM信号处理
+                    trap "should_exit=true; log_info '接收到退出信号，等待当前操作完成后退出...'" SIGINT SIGTERM
+                fi
+            else
+                log_warn "未找到peer名称，尝试重新提取"
+                peer_name=$(extract_peer_name)
+                if [[ -n "$peer_name" ]]; then
+                    local startup_time=$(get_last_startup_time)
+                    save_state "$peer_name" "" "$(date '+%Y-%m-%d %H:%M:%S')" 0 "" "$startup_time"
+                fi
+            fi
+            
+            # 恢复原始的should_exit值
+            should_exit=$original_should_exit
+            last_score_check=$current_time
+            
+            # 如果查分检查后应该退出
+            if [ "$should_exit" = true ]; then
+                log_info "查分检查后收到退出请求，结束循环"
+                return
+            fi
+        fi
+        
+        # P2P错误检查已集成到健康检查中，不需要单独检查
+        
+        # 增加一个简短睡眠后的退出检查，避免长时间等待
+        for ((i=1; i<=$LOG_CHECK_INTERVAL; i+=10)); do
+            sleep 10
+            
+            # 每10秒检查一次是否应该退出
+            if [ "$should_exit" = true ]; then
+                log_info "睡眠期间收到退出请求，结束循环"
+                return
+            fi
+        done
+    done
 }
 
 # 调试函数 - 显示启动时间信息
