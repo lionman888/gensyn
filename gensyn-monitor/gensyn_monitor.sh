@@ -1102,9 +1102,12 @@ main_monitor_loop() {
                     # 非P2P错误的常规处理
                     log_info "健康检查失败原因：非P2P错误，进行常规重启"
                     
+                    # 先检查当前screen会话状态
                     if check_screen_session; then
+                        log_info "检测到已有screen会话，在现有会话中重启"
                         restart_in_screen
                     else
+                        log_warn "没有找到screen会话，创建一个新的"
                         create_screen_session
                     fi
                     
@@ -1126,9 +1129,18 @@ main_monitor_loop() {
                             
                                                          # 在恢复期内，优先检查P2P错误
                              if check_p2p_error; then
-                                 log_warn "恢复期发现P2P错误，重新启动"
-                                 restart_in_screen
-                                 sleep 60
+                                 log_warn "恢复期发现P2P错误，尝试重启应用"
+                                 # 只在screen会话存在的情况下重启，不创建新会话
+                                 if check_screen_session; then
+                                     log_info "在现有screen会话中重启应用"
+                                     restart_in_screen
+                                     sleep 60
+                                 else
+                                     log_error "恢复期检测到screen会话不存在，这是异常情况"
+                                     # 仅在这种异常情况下创建新会话
+                                     log_warn "创建新的screen会话"
+                                     create_screen_session
+                                 fi
                              elif check_identity_stuck; then
                                  log_warn "恢复期发现身份文件卡住，尝试修复"
                                  if auto_copy_identity_files; then
@@ -1141,6 +1153,81 @@ main_monitor_loop() {
                                  log_info "恢复期检查：程序已成功启动"
                                  # 不立即退出恢复期，让程序稳定运行一段时间
                              fi
+                         done
+                        
+                        if [[ "$p2p_fixed" == "true" ]]; then
+                            break
+                        fi
+                    done
+                    
+                    if [[ $p2p_retry_count -ge $max_p2p_retries ]]; then
+                        log_error "P2P错误修复失败，已尝试 $max_p2p_retries 次"
+                        send_telegram_message "P2P连接持续错误，已尝试修复 $max_p2p_retries 次，需要人工处理"
+                    fi
+                    
+                else
+                    # 非P2P错误的常规处理
+                    log_info "健康检查失败原因：非P2P错误，进行常规重启"
+                    
+                    # 先检查当前screen会话状态
+                    if check_screen_session; then
+                        log_info "检测到已有screen会话，在现有会话中重启"
+                        restart_in_screen
+                    else
+                        log_warn "没有找到screen会话，创建一个新的"
+                        create_screen_session
+                    fi
+                    
+                    # 重启后进入恢复期
+                    log_info "重启完成，进入10分钟恢复期..."
+                    local recovery_start=$(date +%s)
+                    
+                    while true; do
+                        local recovery_elapsed=$(($(date +%s) - recovery_start))
+                        
+                        if [[ $recovery_elapsed -gt 600 ]]; then  # 10分钟恢复期
+                            log_warn "恢复期结束，继续正常监控"
+                            break
+                        fi
+                        
+                        # 每60秒检查一次恢复状态
+                        if [[ $((recovery_elapsed % 60)) -eq 0 ]]; then
+                            log_info "恢复期状态检查：已过 $recovery_elapsed 秒"
+                            
+                            # 在恢复期内，优先检查P2P错误
+                            if check_p2p_error; then
+                                log_warn "恢复期发现P2P错误，尝试重启应用"
+                                # 只在screen会话存在的情况下重启，不创建新会话
+                                if check_screen_session; then
+                                    log_info "在现有screen会话中重启应用"
+                                    restart_in_screen
+                                    sleep 60
+                                else
+                                    log_error "恢复期检测到screen会话不存在，这是异常情况"
+                                    # 仅在这种异常情况下创建新会话
+                                    log_warn "创建新的screen会话"
+                                    create_screen_session
+                                fi
+                            elif check_identity_stuck; then
+                                log_warn "恢复期发现身份文件卡住，尝试修复"
+                                if auto_copy_identity_files; then
+                                    log_info "恢复期：身份文件已修复，等待程序处理"
+                                    sleep 120  # 等待2分钟让程序处理身份文件
+                                else
+                                    log_error "恢复期：身份文件修复失败"
+                                fi
+                            elif check_startup_success; then
+                                log_info "恢复期检查：程序已成功启动"
+                                # 不立即退出恢复期，让程序稳定运行一段时间
+                            fi
+                            
+                            if ! check_p2p_error; then
+                                log_info "P2P错误已修复！"
+                                p2p_fixed=true
+                                break
+                            else
+                                log_warn "P2P错误仍存在，继续等待... ($p2p_wait/180秒)"
+                            fi
                         fi
                         
                         sleep 30  # 每30秒检查一次
@@ -1219,10 +1306,19 @@ main() {
     mkdir -p "$(dirname "$MONITOR_LOG")"
     mkdir -p "$(dirname "$STATE_FILE")"
     
-    # 初始化启动
-    if ! handle_startup; then
-        log_error "初始化启动失败"
+    # 检查是否已经有监控脚本在运行
+    local monitor_pid=$(pgrep -f "gensyn_monitor.sh" | grep -v "$$")
+    if [[ -n "$monitor_pid" ]]; then
+        log_error "检测到另一个监控脚本正在运行(PID: $monitor_pid)，退出当前实例"
         exit 1
+    fi
+    
+    # 检查screen会话
+    if ! check_screen_session; then
+        log_info "没有找到screen会话，创建一个新的"
+        create_screen_session
+    else
+        log_info "检测到已有screen会话，将继续使用现有会话"
     fi
     
     # 标记是否应该退出
@@ -1332,9 +1428,12 @@ main_monitor_loop_with_exit_check() {
                     # 非P2P错误的常规处理
                     log_info "健康检查失败原因：非P2P错误，进行常规重启"
                     
+                    # 先检查当前screen会话状态
                     if check_screen_session; then
+                        log_info "检测到已有screen会话，在现有会话中重启"
                         restart_in_screen
                     else
+                        log_warn "没有找到screen会话，创建一个新的"
                         create_screen_session
                     fi
                     
@@ -1356,9 +1455,18 @@ main_monitor_loop_with_exit_check() {
                             
                             # 在恢复期内，优先检查P2P错误
                             if check_p2p_error; then
-                                log_warn "恢复期发现P2P错误，重新启动"
-                                restart_in_screen
-                                sleep 60
+                                log_warn "恢复期发现P2P错误，尝试重启应用"
+                                # 只在screen会话存在的情况下重启，不创建新会话
+                                if check_screen_session; then
+                                    log_info "在现有screen会话中重启应用"
+                                    restart_in_screen
+                                    sleep 60
+                                else
+                                    log_error "恢复期检测到screen会话不存在，这是异常情况"
+                                    # 仅在这种异常情况下创建新会话
+                                    log_warn "创建新的screen会话"
+                                    create_screen_session
+                                fi
                             elif check_identity_stuck; then
                                 log_warn "恢复期发现身份文件卡住，尝试修复"
                                 if auto_copy_identity_files; then
@@ -1370,6 +1478,14 @@ main_monitor_loop_with_exit_check() {
                             elif check_startup_success; then
                                 log_info "恢复期检查：程序已成功启动"
                                 # 不立即退出恢复期，让程序稳定运行一段时间
+                            fi
+                            
+                            if ! check_p2p_error; then
+                                log_info "P2P错误已修复！"
+                                p2p_fixed=true
+                                break
+                            else
+                                log_warn "P2P错误仍存在，继续等待... ($p2p_wait/180秒)"
                             fi
                         fi
                         
