@@ -25,7 +25,8 @@ CHAT_ID="5519262792"
 # 监控配置
 MAX_P2P_RETRIES=5
 SCORE_CHECK_INTERVAL=3600  # 1小时
-SCORE_UNCHANGED_THRESHOLD=3  # 连续3小时无变化触发重启
+SCORE_UNCHANGED_THRESHOLD=1  # 连续1小时分数无变化触发重启
+REWARD_UNCHANGED_THRESHOLD=2  # 连续2小时奖励无变化触发重启
 HEALTH_CHECK_INTERVAL=300   # 5分钟健康检查
 LOG_CHECK_INTERVAL=60       # 1分钟日志检查
 
@@ -140,36 +141,47 @@ check_network_connectivity() {
 
 # 状态文件管理
 save_state() {
-    local peer_name="$1"
-    local last_score="$2"
-    local last_check_time="$3"
-    local unchanged_count="$4"
+    local peer_name="${1:-}"
+    local last_score="${2:-}"
+    local last_check_time="${3:-}"
+    local unchanged_count="${4:-0}"
     local last_reward="${5:-}"
-    local startup_time="${6:-}"
+    local last_startup_time="${6:-0}"
+    local reward_unchanged_count="${7:-0}"
     
-    # 如果没有提供启动时间，尝试获取最新的启动时间
-    if [[ -z "$startup_time" ]]; then
-        startup_time=$(get_last_startup_time)
+    # 如果没有提供参数，尝试从当前状态文件加载
+    if [[ -z "$peer_name" ]]; then
+        local state=$(load_state)
+        peer_name=$(echo "$state" | grep -oP '"peer_name":\s*"\K[^"]*')
+        last_score=$(echo "$state" | grep -oP '"last_score":\s*"\K[^"]*')
+        last_check_time=$(echo "$state" | grep -oP '"last_check_time":\s*"\K[^"]*')
+        unchanged_count=$(echo "$state" | grep -oP '"unchanged_count":\s*\K[0-9]+')
+        last_reward=$(echo "$state" | grep -oP '"last_reward":\s*"\K[^"]*')
+        last_startup_time=$(echo "$state" | grep -oP '"last_startup_time":\s*"\K[^"]*')
+        reward_unchanged_count=$(echo "$state" | grep -oP '"reward_unchanged_count":\s*\K[0-9]+' || echo "0")
     fi
     
-    cat > "$STATE_FILE" << EOF
-{
-    "peer_name": "$peer_name",
-    "last_score": "$last_score",
-    "last_reward": "$last_reward",
-    "last_check_time": "$last_check_time",
-    "unchanged_count": $unchanged_count,
-    "last_restart_time": "$(date '+%Y-%m-%d %H:%M:%S')",
-    "last_startup_time": "$startup_time"
-}
-EOF
+    # 创建JSON格式的状态
+    local json_state="{\
+\"peer_name\": \"$peer_name\", \
+\"last_score\": \"$last_score\", \
+\"last_reward\": \"$last_reward\", \
+\"last_check_time\": \"$last_check_time\", \
+\"unchanged_count\": $unchanged_count, \
+\"reward_unchanged_count\": $reward_unchanged_count, \
+\"last_restart_time\": \"$(date '+%Y-%m-%d %H:%M:%S')\", \
+\"last_startup_time\": \"$last_startup_time\"\
+}"
+    
+    # 保存到文件
+    echo "$json_state" > "$STATE_FILE"
 }
 
 load_state() {
     if [[ -f "$STATE_FILE" ]]; then
         cat "$STATE_FILE"
     else
-        echo '{"peer_name": "", "last_score": "", "last_reward": "", "last_check_time": "", "unchanged_count": 0, "last_restart_time": "", "last_startup_time": "0"}'
+        echo '{"peer_name": "", "last_score": "", "last_reward": "", "last_check_time": "", "unchanged_count": 0, "reward_unchanged_count": 0, "last_restart_time": "", "last_startup_time": "0"}'
     fi
 }
 
@@ -687,11 +699,13 @@ check_score_change() {
     local last_score=$(echo "$state" | grep -oP '"last_score":\s*"\K[^"]*')
     local last_reward=$(echo "$state" | grep -oP '"last_reward":\s*"\K[^"]*')
     local unchanged_count=$(echo "$state" | grep -oP '"unchanged_count":\s*\K[0-9]+')
+    local reward_unchanged_count=$(echo "$state" | grep -oP '"reward_unchanged_count":\s*\K[0-9]+' || echo "0")
     
     # 检查是否有新的启动，如果有则重置计数器
     if check_new_startup; then
-        log_info "检测到新的启动，重置分数变化计数器"
+        log_info "检测到新的启动，重置分数和奖励变化计数器"
         unchanged_count=0
+        reward_unchanged_count=0
     fi
     
     # 查询当前分数和奖励
@@ -712,21 +726,21 @@ check_score_change() {
     log_info "在线状态: $online_status"
     
     # 检查设备是否在线
-            if [[ "$online_status" == "false" ]]; then
+    if [[ "$online_status" == "false" ]]; then
         log_error "设备离线，触发重启"
         send_telegram_message "设备离线，触发重启
 当前分数: $current_score
 当前奖励: $current_reward
 在线状态: 离线"
         
-        save_state "$peer_name" "$current_score" "$current_time" "$unchanged_count" "$current_reward"
+        save_state "$peer_name" "$current_score" "$current_time" "$unchanged_count" "$current_reward" "" "$reward_unchanged_count"
         return 1  # 需要重启
     fi
     
     # 检查分数是否无变化
     if [[ "$current_score" == "$last_score" ]]; then
         unchanged_count=$((unchanged_count + 1))
-        log_warn "分数未变化，连续 $unchanged_count 次"
+        log_warn "分数未变化，连续 $unchanged_count 小时"
         
         if [[ $unchanged_count -ge $SCORE_UNCHANGED_THRESHOLD ]]; then
             log_error "分数连续 $unchanged_count 小时未变化，触发重启"
@@ -737,15 +751,39 @@ check_score_change() {
             
             # 重置计数器并触发重启
             unchanged_count=0
-            save_state "$peer_name" "$current_score" "$current_time" "$unchanged_count" "$current_reward"
+            reward_unchanged_count=0
+            save_state "$peer_name" "$current_score" "$current_time" "$unchanged_count" "$current_reward" "" "$reward_unchanged_count"
             return 1  # 需要重启
         fi
     else
-        log_info "分数有变化，重置计数器"
+        log_info "分数有变化，重置分数计数器"
         unchanged_count=0
     fi
     
-    save_state "$peer_name" "$current_score" "$current_time" "$unchanged_count" "$current_reward"
+    # 检查奖励是否无变化
+    if [[ "$current_reward" == "$last_reward" && "$current_reward" != "N/A" && -n "$last_reward" ]]; then
+        reward_unchanged_count=$((reward_unchanged_count + 1))
+        log_warn "奖励未变化，连续 $reward_unchanged_count 小时"
+        
+        if [[ $reward_unchanged_count -ge $REWARD_UNCHANGED_THRESHOLD ]]; then
+            log_error "奖励连续 $reward_unchanged_count 小时未变化，触发重启"
+            send_telegram_message "奖励连续 $reward_unchanged_count 小时未变化，触发重启
+当前分数: $current_score
+当前奖励: $current_reward
+连续未变化次数: $reward_unchanged_count"
+            
+            # 重置计数器并触发重启
+            unchanged_count=0
+            reward_unchanged_count=0
+            save_state "$peer_name" "$current_score" "$current_time" "$unchanged_count" "$current_reward" "" "$reward_unchanged_count"
+            return 1  # 需要重启
+        fi
+    else
+        log_info "奖励有变化，重置奖励计数器"
+        reward_unchanged_count=0
+    fi
+    
+    save_state "$peer_name" "$current_score" "$current_time" "$unchanged_count" "$current_reward" "" "$reward_unchanged_count"
     return 0  # 不需要重启
 }
 
@@ -797,41 +835,15 @@ handle_startup() {
         log_info "Screen会话已存在"
     fi
     
-    # 立即检查是否已经启动成功（对于长时间运行的程序）
+    # 检查是否已经成功启动
     if check_startup_success; then
         local peer_name=$(extract_peer_name)
-        log_info "启动成功！动物名称: $peer_name"
         
-        # 验证名称
-        if validate_peer_name "$peer_name"; then
-            log_info "动物名称验证通过: $peer_name"
-            local startup_time=$(get_last_startup_time)
-            save_state "$peer_name" "" "$(date '+%Y-%m-%d %H:%M:%S')" 0 "" "$startup_time"
-            send_telegram_message "监控脚本已启动并正常运行
-当前状态: 正常运行
-监控功能: 已激活"
-            return 0
-        else
-            log_error "动物名称验证失败: $peer_name"
-            send_telegram_message "动物名称验证失败！
-该名称不在预设名单中，请检查账号配置"
-            return 1
-        fi
-    fi
-    
-    # 如果没有立即检测到成功，等待新的启动
-    log_info "等待程序启动..."
-    local wait_time=0
-    while [[ $wait_time -lt 300 ]]; do
-        if check_startup_success; then
-            local peer_name=$(extract_peer_name)
-            log_info "启动成功！动物名称: $peer_name"
-            
-            # 验证名称
+        if [[ -n "$peer_name" ]]; then
             if validate_peer_name "$peer_name"; then
-                log_info "动物名称验证通过: $peer_name"
+                log_info "检测到有效的peer名称: $peer_name"
                 local startup_time=$(get_last_startup_time)
-                save_state "$peer_name" "" "$(date '+%Y-%m-%d %H:%M:%S')" 0 "" "$startup_time"
+                save_state "$peer_name" "" "$(date '+%Y-%m-%d %H:%M:%S')" 0 "" "$startup_time" 0
                 send_telegram_message "监控脚本已启动并正常运行
 当前状态: 正常运行
 监控功能: 已激活"
@@ -843,6 +855,32 @@ handle_startup() {
                 return 1
             fi
         fi
+    fi
+    
+    # 如果没有立即检测到成功，等待新的启动
+    log_info "等待程序启动..."
+    local wait_time=0
+    while [[ $wait_time -lt 300 ]]; do
+        if check_startup_success; then
+            local peer_name=$(extract_peer_name)
+            
+            if [[ -n "$peer_name" ]]; then
+                if validate_peer_name "$peer_name"; then
+                    log_info "检测到有效的peer名称: $peer_name"
+                    local startup_time=$(get_last_startup_time)
+                    save_state "$peer_name" "" "$(date '+%Y-%m-%d %H:%M:%S')" 0 "" "$startup_time" 0
+                    send_telegram_message "监控脚本已启动并正常运行
+当前状态: 正常运行
+监控功能: 已激活"
+                    return 0
+                else
+                    log_error "动物名称验证失败: $peer_name"
+                    send_telegram_message "动物名称验证失败！
+该名称不在预设名单中，请检查账号配置"
+                    return 1
+                fi
+            fi
+        fi
         
         # 检查是否有P2P错误
         if check_p2p_error; then
@@ -851,8 +889,9 @@ handle_startup() {
             wait_time=0  # 重置等待时间
         fi
         
-        sleep 10
-        wait_time=$((wait_time + 10))
+        sleep 30
+        wait_time=$((wait_time + 30))
+        log_info "等待启动中... $wait_time/300秒"
     done
     
     log_error "启动超时，未能成功启动"
@@ -1102,7 +1141,7 @@ main_monitor_loop() {
                 peer_name=$(extract_peer_name)
                 if [[ -n "$peer_name" ]]; then
                     local startup_time=$(get_last_startup_time)
-                    save_state "$peer_name" "" "$(date '+%Y-%m-%d %H:%M:%S')" 0 "" "$startup_time"
+                    save_state "$peer_name" "" "$(date '+%Y-%m-%d %H:%M:%S')" 0 "" "$startup_time" 0
                 fi
             fi
             last_score_check=$current_time
